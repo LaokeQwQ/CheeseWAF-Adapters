@@ -17,10 +17,14 @@ func TestAuthzMapsAllowAndOriginalContext(t *testing.T) {
 	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request inspectionv1.Request
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			t.Fatal(err)
+			t.Errorf("decode inspection request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if request.Method != http.MethodPost || request.Path != "/login" || request.Client.IP != "203.0.113.10" {
-			t.Fatalf("unexpected request: %+v", request)
+			t.Errorf("unexpected request: %+v", request)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"action":"allow"}`))
@@ -53,10 +57,14 @@ func TestAuthzDoesNotForwardSensitiveHeadersByDefault(t *testing.T) {
 	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request inspectionv1.Request
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			t.Fatal(err)
+			t.Errorf("decode inspection request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if _, ok := request.Headers["Authorization"]; ok {
-			t.Fatal("authorization header was forwarded by default")
+			t.Error("authorization header was forwarded by default")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"action":"allow"}`))
@@ -124,16 +132,24 @@ func TestAuthzIgnoresForwardedHeadersFromUntrustedPeer(t *testing.T) {
 	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request inspectionv1.Request
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			t.Fatal(err)
+			t.Errorf("decode inspection request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if request.Method != http.MethodGet || request.Path != "/v1/authz" || request.Client.IP != "198.51.100.20" {
-			t.Fatalf("untrusted proxy headers changed request: %+v", request)
+			t.Errorf("untrusted proxy headers changed request: %+v", request)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if request.RequestID == "spoofed" {
-			t.Fatal("untrusted request id was accepted")
+			t.Error("untrusted request id was accepted")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if _, ok := request.Headers["X-Original-URI"]; ok {
-			t.Fatal("untrusted original URI was forwarded")
+			t.Error("untrusted original URI was forwarded")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte("{\"action\":\"allow\"}"))
@@ -174,14 +190,32 @@ func TestTrustedForwardedHostAndProtoCannotBeEmpty(t *testing.T) {
 	}
 }
 
+func TestTrustedForwardedChainFallsBackToLeftmostAddress(t *testing.T) {
+	cfg := config.Default()
+	req := httptest.NewRequest(http.MethodGet, "http://adapter/v1/authz", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Forwarded-For", "127.0.0.1, 127.0.0.1")
+	request, err := requestFromGateway(req, inspectionv1.SourceGeneric, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.Client.IP != "127.0.0.1" {
+		t.Fatalf("fully trusted chain client IP=%q, want leftmost address", request.Client.IP)
+	}
+}
+
 func TestAuthzForwardsBoundedBody(t *testing.T) {
 	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request inspectionv1.Request
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			t.Fatal(err)
+			t.Errorf("decode inspection request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if string(request.Body) != "abcd" || !request.BodyTruncated {
-			t.Fatalf("unexpected bounded body: body=%q truncated=%v", request.Body, request.BodyTruncated)
+			t.Errorf("unexpected bounded body: body=%q truncated=%v", request.Body, request.BodyTruncated)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte("{\"action\":\"allow\"}"))
@@ -235,13 +269,19 @@ func TestEnvoyPartialBodyMarkerIsForwardedAsTruncated(t *testing.T) {
 	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request inspectionv1.Request
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			t.Fatal(err)
+			t.Errorf("decode inspection request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if request.Source != inspectionv1.SourceEnvoyAuth || !request.BodyForwarded || !request.BodyTruncated {
-			t.Fatalf("Envoy partial body marker was lost: source=%q forwarded=%v truncated=%v", request.Source, request.BodyForwarded, request.BodyTruncated)
+			t.Errorf("Envoy partial body marker was lost: source=%q forwarded=%v truncated=%v", request.Source, request.BodyForwarded, request.BodyTruncated)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		if string(request.Body) != "body" {
-			t.Fatalf("unexpected forwarded body: %q", request.Body)
+			t.Errorf("unexpected forwarded body: %q", request.Body)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte("{\"action\":\"allow\"}"))
@@ -365,7 +405,9 @@ func TestReadyProbesCoreAndCaches(t *testing.T) {
 	probes := 0
 	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/healthz" {
-			t.Fatalf("unexpected health path %s", r.URL.Path)
+			t.Errorf("unexpected health path %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		probes++
 		w.WriteHeader(http.StatusOK)

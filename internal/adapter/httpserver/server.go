@@ -685,9 +685,14 @@ func validForwardedIP(value string) string {
 
 func forwardedClientIP(value string, cidrs []string) string {
 	parts := strings.Split(value, ",")
+	leftmost := ""
 	for _, part := range parts {
-		if validForwardedIP(part) == "" {
+		candidate := validForwardedIP(part)
+		if candidate == "" {
 			return ""
+		}
+		if leftmost == "" {
+			leftmost = candidate
 		}
 	}
 	for index := len(parts) - 1; index >= 0; index-- {
@@ -699,7 +704,10 @@ func forwardedClientIP(value string, cidrs []string) string {
 			return candidate
 		}
 	}
-	return ""
+	// A fully trusted chain is valid but does not expose an external client
+	// address. Preserve the leftmost asserted address instead of treating the
+	// complete chain as malformed; the caller still knows the peer was trusted.
+	return leftmost
 }
 
 func trustedAddress(value string, cidrs []string) bool {

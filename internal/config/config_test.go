@@ -39,6 +39,7 @@ func TestFromEnv(t *testing.T) {
 
 func TestValidateRejectsInvalidFailMode(t *testing.T) {
 	cfg := Default()
+	cfg.CoreURL = "http://core.test"
 	cfg.FailMode = "sometimes"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected invalid fail mode error")
@@ -47,6 +48,7 @@ func TestValidateRejectsInvalidFailMode(t *testing.T) {
 
 func TestValidateRejectsUnboundedBodyConfig(t *testing.T) {
 	cfg := Default()
+	cfg.CoreURL = "http://core.test"
 	cfg.MaxBodyBytes = 17 << 20
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected body size limit error")
@@ -81,6 +83,7 @@ func TestFromEnvCanClearHealthAndTrustedProxyDefaults(t *testing.T) {
 
 func TestValidateRejectsInvalidTrustedProxyCIDR(t *testing.T) {
 	cfg := Default()
+	cfg.CoreURL = "http://core.test"
 	cfg.TrustedProxyCIDRs = []string{"not-a-cidr"}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected trusted proxy CIDR error")

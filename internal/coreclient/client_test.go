@@ -14,7 +14,9 @@ import (
 func TestInspect(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/inspect" || r.Header.Get("Authorization") != "Bearer test-token" {
-			t.Fatalf("unexpected request: path=%s auth=%q", r.URL.Path, r.Header.Get("Authorization"))
+			t.Errorf("unexpected request: path=%s auth=%q", r.URL.Path, r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"action":"block","reason":"test","policy_version":"p1"}`))
@@ -56,7 +58,9 @@ func TestTelemetry(t *testing.T) {
 	called := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/telemetry" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
+			t.Errorf("unexpected path %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		called <- struct{}{}
 		w.WriteHeader(http.StatusAccepted)
@@ -97,7 +101,9 @@ func TestInspectRejectsUnknownDecisionAsProtocolError(t *testing.T) {
 func TestReadyUsesHealthPathAndToken(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/healthz" || r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer test-token" {
-			t.Fatalf("unexpected health request: method=%s path=%s auth=%q", r.Method, r.URL.Path, r.Header.Get("Authorization"))
+			t.Errorf("unexpected health request: method=%s path=%s auth=%q", r.Method, r.URL.Path, r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
