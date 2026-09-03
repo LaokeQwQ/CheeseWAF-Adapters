@@ -389,7 +389,7 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 		if err != nil {
 			return inspectionv1.Request{}, err
 		}
-		if hostPresent && strings.TrimSpace(rawHost) != "" {
+		if hostPresent {
 			forwardedHostRaw, ok := singleForwardedValue(rawHost)
 			forwardedHost := safeAuthority(forwardedHostRaw)
 			if !ok || forwardedHost == "" {
@@ -401,7 +401,7 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 		if err != nil {
 			return inspectionv1.Request{}, err
 		}
-		if schemePresent && strings.TrimSpace(rawScheme) != "" {
+		if schemePresent {
 			forwardedSchemeRaw, ok := singleForwardedValue(rawScheme)
 			forwardedSchemeValue := strings.ToLower(forwardedSchemeRaw)
 			if !ok || (forwardedSchemeValue != "http" && forwardedSchemeValue != "https") {

@@ -162,6 +162,18 @@ func TestAuthzIgnoresForwardedHeadersFromUntrustedPeer(t *testing.T) {
 	}
 }
 
+func TestTrustedForwardedHostAndProtoCannotBeEmpty(t *testing.T) {
+	cfg := config.Default()
+	for _, header := range []string{"X-Forwarded-Host", "X-Forwarded-Proto"} {
+		req := httptest.NewRequest(http.MethodGet, "http://adapter/v1/authz", nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set(header, "   ")
+		if _, err := requestFromGateway(req, inspectionv1.SourceGeneric, cfg); err == nil {
+			t.Errorf("empty trusted %s unexpectedly accepted", header)
+		}
+	}
+}
+
 func TestAuthzForwardsBoundedBody(t *testing.T) {
 	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request inspectionv1.Request
