@@ -56,7 +56,8 @@
 - NGINX：[adapters/nginx/auth_request.conf](adapters/nginx/auth_request.conf)
 - Envoy：[adapters/envoy/ext_authz.yaml](adapters/envoy/ext_authz.yaml)
 
-示例使用本机 HTTP hop。生产环境应将适配器限制在私有网络、配置 `CHEESEWAF_ADAPTER_TOKEN`，并在跨主机或跨 Pod 时启用 mTLS。只有来自 `CHEESEWAF_ADAPTER_TRUSTED_PROXY_CIDRS` 的对端才会被信任以提供原始/转发请求元数据。
+示例使用本机 HTTP hop。生产环境应将适配器限制在私有网络、配置 `CHEESEWAF_ADAPTER_TOKEN`（通过专用 `X-CheeseWAF-Adapter-Token` Header 传入，不读取 `Authorization`），并在跨主机或跨 Pod 时启用 mTLS。只有来自 `CHEESEWAF_ADAPTER_TRUSTED_PROXY_CIDRS` 的对端才会被信任以提供原始/转发请求元数据。
+当 Envoy 报告 `x-envoy-auth-partial-body: true` 时，适配器会把契约 Body 标记为不完整；即使核心返回 `allow`/`log` 或核心超时，也返回 HTTP 413。关闭 Body 转发时则直接拒绝该 partial-body 请求。
 
 ## 配置
 
@@ -68,12 +69,12 @@
 | `CHEESEWAF_CORE_TELEMETRY_PATH` | `/api/v1/adapter/telemetry` | 尽力而为的 telemetry 接口。 |
 | `CHEESEWAF_CORE_HEALTH_PATH` | `/healthz` | 核心就绪探测接口；为空时关闭客户端探测。 |
 | `CHEESEWAF_CORE_TOKEN` | 空 | adapterd 发给自托管核心的 Bearer token。 |
-| `CHEESEWAF_ADAPTER_TOKEN` | 空 | 网关调用方可选的 Bearer token；监听非 loopback 时应设置。 |
-| `CHEESEWAF_ADAPTER_TRUSTED_PROXY_CIDRS` | `127.0.0.0/8,::1/128` | 允许提供原始/转发请求元数据的对端 CIDR。 |
+| `CHEESEWAF_ADAPTER_TOKEN` | 空 | 网关调用方可选的专用密钥，必须放在 `X-CheeseWAF-Adapter-Token` Header；不读取 `Authorization`，监听非 loopback 时应设置。 |
+| `CHEESEWAF_ADAPTER_TRUSTED_PROXY_CIDRS` | `127.0.0.1/32,::1/128` | 允许提供原始/转发请求元数据的对端 CIDR；仅按需扩大到受控代理网段。 |
 | `CHEESEWAF_ADAPTER_REQUEST_TIMEOUT` / `--request-timeout` | `100ms` | inline 决策预算。 |
 | `CHEESEWAF_ADAPTER_TELEMETRY_TIMEOUT` | `500ms` | telemetry 调用预算。 |
 | `CHEESEWAF_ADAPTER_FAIL_MODE` / `--fail-mode` | `closed` | `closed` 返回 `503`；`open` 在核心失败时返回 `204`。 |
-| `CHEESEWAF_ADAPTER_FORWARD_BODY` | `false` | 显式开启有界 Body 转发，超过上限时在契约中标记截断。 |
+| `CHEESEWAF_ADAPTER_FORWARD_BODY` | `false` | 显式开启有界 Body 转发；超过上限时以 `BodyTruncated=true` 发送，若核心返回 `allow`/`log` 则适配器返回 HTTP 413。 |
 | `CHEESEWAF_ADAPTER_MAX_BODY_BYTES` | `65536` | 开启 Body 转发时的大小上限（受适配器校验约束）。 |
 | `CHEESEWAF_ADAPTER_FORWARD_SENSITIVE_HEADERS` | `false` | 显式允许向自托管核心转发带凭据的 Header。 |
 

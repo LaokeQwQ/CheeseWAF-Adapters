@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -160,7 +161,7 @@ func (c *Client) Ready(ctx context.Context) error {
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return &transportError{err: fmt.Errorf("check core health: %w", err)}
+		return classifyHTTPError("check core health", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, c.maxResponse+1))
@@ -286,7 +287,7 @@ func (c *Client) postJSON(ctx context.Context, path string, payload any, output 
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return &transportError{err: fmt.Errorf("call core: %w", err)}
+		return classifyHTTPError("call core", err)
 	}
 	defer resp.Body.Close()
 	limited := io.LimitReader(resp.Body, c.maxResponse+1)
@@ -307,4 +308,31 @@ func (c *Client) postJSON(ctx context.Context, path string, payload any, output 
 		return &protocolError{err: fmt.Errorf("decode core response: %w", err)}
 	}
 	return nil
+}
+
+// classifyHTTPError keeps fail-open limited to errors that indicate a genuine
+// network/transport outage. The net/http client can also return local request
+// construction or custom RoundTripper errors; treating those as transport
+// failures would let an open-mode adapter bypass inspection indefinitely.
+func classifyHTTPError(operation string, err error) error {
+	wrapped := fmt.Errorf("%s: %w", operation, err)
+	// url.Error implements net.Error itself, even when its wrapped cause is a
+	// local request/configuration failure. Inspect the underlying cause before
+	// applying the network-error check so those failures cannot be fail-opened.
+	underlying := err
+	for {
+		urlErr, ok := underlying.(*url.Error)
+		if !ok {
+			break
+		}
+		underlying = urlErr.Err
+	}
+	if errors.Is(underlying, context.Canceled) || errors.Is(underlying, context.DeadlineExceeded) {
+		return &transportError{err: wrapped}
+	}
+	var networkErr net.Error
+	if errors.As(underlying, &networkErr) {
+		return &transportError{err: wrapped}
+	}
+	return &protocolError{err: wrapped}
 }

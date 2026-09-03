@@ -2,6 +2,7 @@ package coreclient
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -133,6 +134,33 @@ func TestNewRejectsTokenOverPlaintextRemoteURL(t *testing.T) {
 	if _, err := New(Config{BaseURL: "http://core.example", InspectPath: "/inspect", Token: "secret"}); err == nil {
 		t.Fatal("expected plaintext remote token rejection")
 	}
+}
+
+func TestNewRejectsTokenWithControlCharacters(t *testing.T) {
+	if _, err := New(Config{BaseURL: "http://127.0.0.1:8080", InspectPath: "/inspect", Token: "bad\nvalue"}); err == nil {
+		t.Fatal("expected invalid token rejection")
+	}
+}
+
+func TestInspectDoesNotClassifyLocalRoundTripperErrorAsTransport(t *testing.T) {
+	client, err := New(Config{
+		BaseURL:     "http://127.0.0.1:8080",
+		InspectPath: "/inspect",
+		HTTPClient:  &http.Client{Transport: failingRoundTripper{}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Inspect(context.Background(), inspectionv1.Request{Method: http.MethodGet, Path: "/"})
+	if err == nil || !IsProtocolError(err) || IsTransportError(err) {
+		t.Fatalf("round tripper error=%v, protocol=%v transport=%v; want protocol only", err, IsProtocolError(err), IsTransportError(err))
+	}
+}
+
+type failingRoundTripper struct{}
+
+func (failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("invalid header field value")
 }
 
 func TestTelemetryRejectsInvalidMetadata(t *testing.T) {

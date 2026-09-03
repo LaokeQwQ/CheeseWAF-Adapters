@@ -56,7 +56,8 @@ The adapter calls the configured core inspection endpoint (default path: `/api/v
 - NGINX: [adapters/nginx/auth_request.conf](adapters/nginx/auth_request.conf)
 - Envoy: [adapters/envoy/ext_authz.yaml](adapters/envoy/ext_authz.yaml)
 
-The examples use a local HTTP hop for the initial contract. Production deployments should put the adapter on a private network, configure `CHEESEWAF_ADAPTER_TOKEN`, and use mTLS before exposing it beyond the host or Pod. Forwarded headers are honored only when the peer address matches `CHEESEWAF_ADAPTER_TRUSTED_PROXY_CIDRS`.
+The examples use a local HTTP hop for the initial contract. Production deployments should put the adapter on a private network, configure `CHEESEWAF_ADAPTER_TOKEN` (presented in the dedicated `X-CheeseWAF-Adapter-Token` header, not `Authorization`), and use mTLS before exposing it beyond the host or Pod. Forwarded headers are honored only when the peer address matches `CHEESEWAF_ADAPTER_TRUSTED_PROXY_CIDRS`.
+When Envoy reports `x-envoy-auth-partial-body: true`, the adapter marks the contract body as incomplete; even an `allow`/`log` decision or a core timeout returns HTTP 413. With body forwarding disabled, a partial-body marker is rejected.
 
 ## Configuration
 
@@ -68,12 +69,12 @@ The examples use a local HTTP hop for the initial contract. Production deploymen
 | `CHEESEWAF_CORE_TELEMETRY_PATH` | `/api/v1/adapter/telemetry` | Best-effort telemetry route. |
 | `CHEESEWAF_CORE_HEALTH_PATH` | `/healthz` | Core readiness probe route; empty disables the client-side probe. |
 | `CHEESEWAF_CORE_TOKEN` | empty | Bearer token sent from adapterd to the self-hosted core. |
-| `CHEESEWAF_ADAPTER_TOKEN` | empty | Optional bearer token required from gateway callers; set it outside loopback. |
-| `CHEESEWAF_ADAPTER_TRUSTED_PROXY_CIDRS` | `127.0.0.0/8,::1/128` | CIDRs allowed to supply original/forwarded request metadata. |
+| `CHEESEWAF_ADAPTER_TOKEN` | empty | Optional secret required in the `X-CheeseWAF-Adapter-Token` header; set it outside loopback. It is not read from `Authorization`. |
+| `CHEESEWAF_ADAPTER_TRUSTED_PROXY_CIDRS` | `127.0.0.1/32,::1/128` | CIDRs allowed to supply original/forwarded request metadata. Expand only to a controlled proxy network. |
 | `CHEESEWAF_ADAPTER_REQUEST_TIMEOUT` / `--request-timeout` | `100ms` | Inline decision budget. |
 | `CHEESEWAF_ADAPTER_TELEMETRY_TIMEOUT` | `500ms` | Telemetry call budget. |
 | `CHEESEWAF_ADAPTER_FAIL_MODE` / `--fail-mode` | `closed` | `closed` returns `503`; `open` returns `204` on core failure. |
-| `CHEESEWAF_ADAPTER_FORWARD_BODY` | `false` | Opt in to forwarding at most the configured body limit; truncation is marked in the contract. |
+| `CHEESEWAF_ADAPTER_FORWARD_BODY` | `false` | Opt in to forwarding at most the configured body limit; oversized bodies are sent with `BodyTruncated=true`, and an `allow`/`log` result returns HTTP 413. |
 | `CHEESEWAF_ADAPTER_MAX_BODY_BYTES` | `65536` | Body limit when forwarding is enabled (bounded by adapter validation). |
 | `CHEESEWAF_ADAPTER_FORWARD_SENSITIVE_HEADERS` | `false` | Explicitly opt in to forwarding credential-bearing headers to the self-hosted core. |
 

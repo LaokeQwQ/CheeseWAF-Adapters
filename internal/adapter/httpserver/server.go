@@ -110,11 +110,18 @@ func (s *Server) authz(w http.ResponseWriter, r *http.Request, source inspection
 	defer cancel()
 	decision, err := s.core.Inspect(ctx, request)
 	if err != nil {
+		// A truncated body is an incomplete security decision input. Never let
+		// transport fail-open turn it into an implicit allow; the gateway must
+		// retry/reject the request instead.
+		if request.BodyTruncated {
+			s.writeBodyLimitFailure(w)
+			return
+		}
 		s.writeFailure(w, err, request.Source)
 		return
 	}
 	if request.BodyTruncated && (decision.Action == inspectionv1.ActionAllow || decision.Action == inspectionv1.ActionLog) {
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body exceeds inspection limit"})
+		s.writeBodyLimitFailure(w)
 		return
 	}
 	s.writeDecision(w, decision, request.RequestID, request.Source)
@@ -176,6 +183,10 @@ func (s *Server) writeClosedFailure(w http.ResponseWriter) {
 	// configured failure policy without treating infrastructure errors as a
 	// WAF match.
 	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "inspection unavailable"})
+}
+
+func (s *Server) writeBodyLimitFailure(w http.ResponseWriter) {
+	writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body exceeds inspection limit"})
 }
 
 func (s *Server) writeDecision(w http.ResponseWriter, decision inspectionv1.Decision, requestID string, source inspectionv1.Source) {
@@ -307,6 +318,7 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 	clientIP := remoteIP(r.RemoteAddr)
 	authority := r.Host
 	scheme := directScheme(r)
+	envoyPartialBody := false
 	if trusted {
 		rawURI, uriPresent, err := singleHeader(r.Header, "X-Original-URI")
 		if err != nil {
@@ -336,6 +348,22 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 				method = originalMethod
 			}
 		}
+		if source == inspectionv1.SourceEnvoyAuth || source == inspectionv1.SourceEnvoyExtProc {
+			rawPartial, partialPresent, err := singleHeader(r.Header, "X-Envoy-Auth-Partial-Body")
+			if err != nil {
+				return inspectionv1.Request{}, err
+			}
+			if partialPresent {
+				switch strings.ToLower(strings.TrimSpace(rawPartial)) {
+				case "true":
+					envoyPartialBody = true
+				case "", "false":
+					// An absent/false marker means the body is not known to be partial.
+				default:
+					return inspectionv1.Request{}, fmt.Errorf("invalid X-Envoy-Auth-Partial-Body")
+				}
+			}
+		}
 		rawRealIP, realPresent, err := singleHeader(r.Header, "X-Real-IP")
 		if err != nil {
 			return inspectionv1.Request{}, err
@@ -362,8 +390,9 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 			return inspectionv1.Request{}, err
 		}
 		if hostPresent && strings.TrimSpace(rawHost) != "" {
-			forwardedHost := safeAuthority(firstForwardedValue(rawHost))
-			if forwardedHost == "" {
+			forwardedHostRaw, ok := singleForwardedValue(rawHost)
+			forwardedHost := safeAuthority(forwardedHostRaw)
+			if !ok || forwardedHost == "" {
 				return inspectionv1.Request{}, fmt.Errorf("invalid X-Forwarded-Host")
 			}
 			authority = forwardedHost
@@ -373,8 +402,9 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 			return inspectionv1.Request{}, err
 		}
 		if schemePresent && strings.TrimSpace(rawScheme) != "" {
-			forwardedSchemeValue := strings.ToLower(firstForwardedValue(rawScheme))
-			if forwardedSchemeValue != "http" && forwardedSchemeValue != "https" {
+			forwardedSchemeRaw, ok := singleForwardedValue(rawScheme)
+			forwardedSchemeValue := strings.ToLower(forwardedSchemeRaw)
+			if !ok || (forwardedSchemeValue != "http" && forwardedSchemeValue != "https") {
 				return inspectionv1.Request{}, fmt.Errorf("invalid X-Forwarded-Proto")
 			}
 			scheme = forwardedSchemeValue
@@ -428,10 +458,15 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 			return inspectionv1.Request{}, fmt.Errorf("read request body: %w", err)
 		}
 		request.Body = body
-		request.BodyTruncated = truncated
+		request.BodyTruncated = truncated || envoyPartialBody
 		request.BodyForwarded = true
 	} else if err := rejectUnexpectedBody(r); err != nil {
 		return inspectionv1.Request{}, err
+	}
+	if envoyPartialBody && !cfg.ForwardBody {
+		// The v1 contract requires BodyTruncated to accompany a forwarded body;
+		// reject rather than silently presenting Envoy's partial input as whole.
+		return inspectionv1.Request{}, fmt.Errorf("Envoy request body is partial but body forwarding is disabled")
 	}
 	return request, nil
 }
@@ -500,7 +535,7 @@ func copiedHeaders(input http.Header, forwardSensitiveHeaders, forwardBody bool)
 			if len(value) > maxHeaderValueBytes {
 				return nil, fmt.Errorf("request header %q exceeds %d bytes", canonical, maxHeaderValueBytes)
 			}
-			if strings.ContainsAny(value, "\r\n") {
+			if strings.ContainsAny(value, "\r\n") || strings.IndexFunc(value, func(r rune) bool { return r < ' ' || r == 127 }) >= 0 {
 				return nil, fmt.Errorf("request header %q contains control characters", canonical)
 			}
 			if totalBytes+len(canonical)+len(value) > maxHeaderBytes {
@@ -604,6 +639,14 @@ func firstForwardedValue(value string) string {
 		value = value[:index]
 	}
 	return strings.TrimSpace(value)
+}
+
+func singleForwardedValue(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsRune(value, ',') {
+		return "", false
+	}
+	return value, true
 }
 
 func singleHeader(input http.Header, key string) (string, bool, error) {

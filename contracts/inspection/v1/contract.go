@@ -160,10 +160,10 @@ func (d Decision) Normalized() Decision {
 }
 
 func validMethod(method string) bool {
-	method = strings.TrimSpace(method)
-	if method == "" {
+	if method == "" || strings.TrimSpace(method) != method {
 		return false
 	}
+
 	for _, r := range method {
 		if r <= ' ' || r == 127 || r == '\\' || r == '"' || strings.ContainsRune("()<>@,;:/[]?={}\t", r) {
 			return false
