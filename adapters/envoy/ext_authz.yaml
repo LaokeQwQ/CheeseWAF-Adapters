@@ -1,0 +1,57 @@
+# Minimal Envoy wiring for a local adapterd HTTP authorization endpoint.
+# This example intentionally uses loopback HTTP only. For a cross-host or
+# cross-Pod deployment, use an HTTPS cluster with certificate validation/mTLS
+# and set CHEESEWAF_ADAPTER_TOKEN on adapterd.
+http_filters:
+  - name: envoy.filters.http.ext_authz
+    typed_config:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+      failure_mode_allow: false
+      status_on_error: { code: ServiceUnavailable }
+      validate_mutations: true
+      http_service:
+        server_uri:
+          uri: http://127.0.0.1:9080
+          cluster: cheesewaf_adapter
+          timeout: 100ms
+        path_override: /envoy/check
+        authorization_request:
+          allowed_headers:
+            patterns:
+              - exact: x-request-id
+              - exact: user-agent
+          headers_to_add:
+            # path_override changes :path before the auth request is sent;
+            # preserve the original method/path with Envoy's formatter.
+            - key: x-original-method
+              value: "%REQ(:METHOD)%"
+            - key: x-original-uri
+              value: "%REQ(:PATH)%"
+            - key: x-real-ip
+              value: "%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%"
+            - key: x-forwarded-proto
+              value: "%REQ(:SCHEME)%"
+            - key: x-forwarded-host
+              value: "%REQ(:AUTHORITY)%"
+            # If CHEESEWAF_ADAPTER_TOKEN is configured, inject the dedicated
+            # x-cheesewaf-adapter-token header from an SDS/secret-managed
+            # value here. Never commit a literal token to this file.
+        authorization_response:
+          allowed_upstream_headers:
+            patterns:
+              - exact: x-cheesewaf-decision
+              - exact: x-cheesewaf-request-id
+
+clusters:
+  - name: cheesewaf_adapter
+    type: STATIC
+    connect_timeout: 100ms
+    load_assignment:
+      cluster_name: cheesewaf_adapter
+      endpoints:
+        - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: 127.0.0.1
+                    port_value: 9080

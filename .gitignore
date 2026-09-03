@@ -1,0 +1,46 @@
+# Build output
+/bin/
+/dist/
+/build/
+/adapterd
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+
+# Go tooling
+*.coverprofile
+coverage.out
+vendor/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local.yaml
+*.local.yml
+*.local.json
+secrets/
+private/
+
+# Runtime state and temporary files
+.runtime/
+.state/
+tmp/
+*.pid
+*.log
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local-only planning and agent policy. These files stay in the operator
+# workspace and are intentionally excluded from the public GitHub tree.
+.project/
+/AGENTS.md
+*.private.md
+*.internal.md
