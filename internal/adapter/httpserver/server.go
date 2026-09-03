@@ -330,7 +330,10 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 				return inspectionv1.Request{}, err
 			}
 		}
-		if uriPresent && strings.TrimSpace(rawURI) != "" {
+		if uriPresent {
+			if strings.TrimSpace(rawURI) == "" {
+				return inspectionv1.Request{}, fmt.Errorf("invalid original URI")
+			}
 			pathValue = rawURI
 		}
 		rawMethod, methodPresent, err := singleHeader(r.Header, "X-Original-Method")
@@ -343,10 +346,12 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 				return inspectionv1.Request{}, err
 			}
 		}
-		if methodPresent && strings.TrimSpace(rawMethod) != "" {
-			if originalMethod := strings.TrimSpace(rawMethod); originalMethod != "" {
-				method = originalMethod
+		if methodPresent {
+			originalMethod := strings.TrimSpace(rawMethod)
+			if originalMethod == "" {
+				return inspectionv1.Request{}, fmt.Errorf("invalid original method")
 			}
+			method = originalMethod
 		}
 		if source == inspectionv1.SourceEnvoyAuth || source == inspectionv1.SourceEnvoyExtProc {
 			rawPartial, partialPresent, err := singleHeader(r.Header, "X-Envoy-Auth-Partial-Body")
@@ -372,13 +377,13 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 		if err != nil {
 			return inspectionv1.Request{}, err
 		}
-		if xffPresent && strings.TrimSpace(rawXFF) != "" {
+		if xffPresent {
 			if forwardedIP := forwardedClientIP(rawXFF, cfg.TrustedProxyCIDRs); forwardedIP != "" {
 				clientIP = forwardedIP
 			} else {
 				return inspectionv1.Request{}, fmt.Errorf("invalid X-Forwarded-For")
 			}
-		} else if realPresent && strings.TrimSpace(rawRealIP) != "" {
+		} else if realPresent {
 			if forwardedIP := validForwardedIP(rawRealIP); forwardedIP != "" {
 				clientIP = forwardedIP
 			} else {
@@ -634,13 +639,6 @@ func hasDotSegment(path string) bool {
 	return false
 }
 
-func firstForwardedValue(value string) string {
-	if index := strings.IndexByte(value, ','); index >= 0 {
-		value = value[:index]
-	}
-	return strings.TrimSpace(value)
-}
-
 func singleForwardedValue(value string) (string, bool) {
 	value = strings.TrimSpace(value)
 	if value == "" || strings.ContainsRune(value, ',') {
@@ -675,7 +673,11 @@ func trustedPeer(remote string, cidrs []string) bool {
 }
 
 func validForwardedIP(value string) string {
-	value = firstForwardedValue(value)
+	var ok bool
+	value, ok = singleForwardedValue(value)
+	if !ok {
+		return ""
+	}
 	addr, err := netip.ParseAddr(strings.Trim(value, "[]"))
 	if err != nil {
 		return ""

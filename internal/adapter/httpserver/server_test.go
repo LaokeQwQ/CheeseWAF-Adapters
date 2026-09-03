@@ -178,9 +178,16 @@ func TestAuthzIgnoresForwardedHeadersFromUntrustedPeer(t *testing.T) {
 	}
 }
 
-func TestTrustedForwardedHostAndProtoCannotBeEmpty(t *testing.T) {
+func TestTrustedForwardedMetadataCannotBeEmpty(t *testing.T) {
 	cfg := config.Default()
-	for _, header := range []string{"X-Forwarded-Host", "X-Forwarded-Proto"} {
+	for _, header := range []string{
+		"X-Original-URI",
+		"X-Original-Method",
+		"X-Forwarded-For",
+		"X-Real-IP",
+		"X-Forwarded-Host",
+		"X-Forwarded-Proto",
+	} {
 		req := httptest.NewRequest(http.MethodGet, "http://adapter/v1/authz", nil)
 		req.RemoteAddr = "127.0.0.1:1234"
 		req.Header.Set(header, "   ")
