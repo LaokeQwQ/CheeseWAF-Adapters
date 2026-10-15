@@ -19,6 +19,7 @@ The repository currently contains the contract and a small, testable `adapterd` 
 - **Inline and out-of-band are separate:** inline authorization may block; mirror-based observation must never be advertised as blocking.
 - **Fail-closed by default:** an unavailable core returns `503 Service Unavailable`. Operators may opt into fail-open explicitly.
 - **Body minimization:** request bodies are not forwarded by default and require an explicit policy decision.
+- **Production dependency boundary:** adapterd packages and images contain only runtime dependencies required by the published adapter contract. Development assistants, editor integrations, and local inspection tooling are excluded from production artifacts.
 
 ## Architecture
 
@@ -36,6 +37,10 @@ The repository currently contains the contract and a small, testable `adapterd` 
                   +-- asynchronous telemetry / postanalytics
 
 The public repository contains the two README files, source code, and runnable integration examples. Internal planning notes and local Agent policy stay in the operator workspace; chat transcripts, credentials, runtime state, and private artifacts are excluded by `.gitignore`.
+
+## Integration scope
+
+`adapterd` currently provides the client-side contract and gateway boundary. The CheeseWAF core does not yet ship the matching inspection and telemetry endpoints, so end-to-end use requires a compatible core endpoint or a separate mock; this repository must not be presented as a completed CheeseWAF integration. Future transports and cross-cluster analytics require separately versioned contracts and tests, remain optional, and stay outside the inline authorization path.
 
 ## Quick start
 
