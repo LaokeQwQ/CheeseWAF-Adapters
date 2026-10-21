@@ -58,8 +58,11 @@
 
 ## 网关示例
 
-- NGINX：[adapters/nginx/auth_request.conf](adapters/nginx/auth_request.conf)
+- NGINX 元数据授权：[adapters/nginx/auth_request.conf](adapters/nginx/auth_request.conf)
+- NGINX njs PHP2Shell Body 检查：[adapters/nginx/php2shell-njs.md](adapters/nginx/php2shell-njs.md)
 - Envoy：[adapters/envoy/ext_authz.yaml](adapters/envoy/ext_authz.yaml)
+
+`auth_request` 示例只转发元数据，无法检查请求 Body。PHP2Shell 的 Body 检测必须使用 njs access 阶段集成：它在 `proxy_pass` 之前读取并缓存 Body，要求 njs 1.0.2 或更高版本。该集成依赖 adapterd 提供 `POST /nginx/body-check`；当前仓库尚未实现这个路由。
 
 示例使用本机 HTTP hop。生产环境应将适配器限制在私有网络、配置 `CHEESEWAF_ADAPTER_TOKEN`（通过专用 `X-CheeseWAF-Adapter-Token` Header 传入，不读取 `Authorization`），并在跨主机或跨 Pod 时启用 mTLS。只有来自 `CHEESEWAF_ADAPTER_TRUSTED_PROXY_CIDRS` 的对端才会被信任以提供原始/转发请求元数据。
 当 Envoy 报告 `x-envoy-auth-partial-body: true` 时，适配器会把契约 Body 标记为不完整；即使核心返回 `allow`/`log` 或核心超时，也返回 HTTP 413。关闭 Body 转发时则直接拒绝该 partial-body 请求。

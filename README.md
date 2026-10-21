@@ -58,8 +58,15 @@ The adapter calls the configured core inspection endpoint (default path: `/api/v
 
 ## Gateway examples
 
-- NGINX: [adapters/nginx/auth_request.conf](adapters/nginx/auth_request.conf)
+- NGINX metadata authorization: [adapters/nginx/auth_request.conf](adapters/nginx/auth_request.conf)
+- NGINX njs body inspection for PHP2Shell: [adapters/nginx/php2shell-njs.md](adapters/nginx/php2shell-njs.md)
 - Envoy: [adapters/envoy/ext_authz.yaml](adapters/envoy/ext_authz.yaml)
+
+The `auth_request` example forwards metadata only and cannot inspect request
+bodies. PHP2Shell body detection requires the njs access-phase integration,
+which reads and caches the body before `proxy_pass` and requires njs 1.0.2 or
+newer. That integration depends on `adapterd` exposing
+`POST /nginx/body-check`; the route is not in this repository yet.
 
 The examples use a local HTTP hop for the initial contract. Production deployments should put the adapter on a private network, configure `CHEESEWAF_ADAPTER_TOKEN` (presented in the dedicated `X-CheeseWAF-Adapter-Token` header, not `Authorization`), and use mTLS before exposing it beyond the host or Pod. Forwarded headers are honored only when the peer address matches `CHEESEWAF_ADAPTER_TRUSTED_PROXY_CIDRS`.
 When Envoy reports `x-envoy-auth-partial-body: true`, the adapter marks the contract body as incomplete; even an `allow`/`log` decision or a core timeout returns HTTP 413. With body forwarding disabled, a partial-body marker is rejected.

@@ -457,3 +457,46 @@ func TestTelemetryLimiter(t *testing.T) {
 		t.Fatal("telemetry limiter did not reset after one second")
 	}
 }
+
+func TestNginxBodyCheckForwardsBoundedBody(t *testing.T) {
+	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request inspectionv1.Request
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode inspection request: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if !request.BodyForwarded || request.BodyTruncated {
+			t.Errorf("body flags = forwarded=%v truncated=%v", request.BodyForwarded, request.BodyTruncated)
+		}
+		if string(request.Body) != "a=1" || request.Method != http.MethodPost || request.Path != "/upload" {
+			t.Errorf("unexpected inspection request: %+v", request)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"action":"allow"}`))
+	}))
+	defer core.Close()
+	client, err := coreclient.New(coreclient.Config{BaseURL: core.URL, InspectPath: "/inspect", HTTPClient: core.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.CoreURL = core.URL
+	cfg.ForwardBody = true
+	cfg.MaxBodyBytes = 1024
+	server, err := New(cfg, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "http://adapter/nginx/body-check", bytes.NewBufferString("a=1"))
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Original-Method", http.MethodPost)
+	req.Header.Set("X-Original-URI", "/upload")
+	req.Header.Set("X-Real-IP", "203.0.113.10")
+	resp := httptest.NewRecorder()
+	server.Handler().ServeHTTP(resp, req)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("unexpected response: code=%d body=%s", resp.Code, resp.Body.String())
+	}
+}

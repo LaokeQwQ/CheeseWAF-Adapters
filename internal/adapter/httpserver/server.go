@@ -67,6 +67,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("/nginx/auth", s.protected(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.authz(w, r, inspectionv1.SourceNginxAuth)
 	})))
+	mux.Handle("/nginx/body-check", s.protected(http.HandlerFunc(s.nginxBodyCheck)))
 	mux.Handle("/envoy/check", s.protected(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.authz(w, r, inspectionv1.SourceEnvoyAuth)
 	})))
@@ -125,6 +126,19 @@ func (s *Server) authz(w http.ResponseWriter, r *http.Request, source inspection
 		return
 	}
 	s.writeDecision(w, decision, request.RequestID, request.Source)
+}
+
+func (s *Server) nginxBodyCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !s.cfg.ForwardBody {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "body inspection is disabled"})
+		return
+	}
+	s.authz(w, r, inspectionv1.SourceNginxAuth)
 }
 
 func (s *Server) telemetry(w http.ResponseWriter, r *http.Request) {
