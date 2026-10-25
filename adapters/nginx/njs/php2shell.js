@@ -82,6 +82,11 @@ function buildHeaders(r, method) {
         'X-Original-Method': method,
     };
 
+    const encoding = r.headersIn['Content-Encoding'];
+    if (encoding) {
+        headers['Content-Encoding'] = String(encoding).trim();
+    }
+
     const uri = optionalVariable(r, 'request_uri', r.uri);
     if (uri) {
         headers['X-Original-URI'] = uri;
@@ -127,6 +132,73 @@ function denyUnavailable(r, message) {
     r.return(503, 'request body inspection unavailable\n');
 }
 
+function responseHeader(reply, name) {
+    try {
+        if (!reply || !reply.headers || typeof reply.headers.get !== 'function') {
+            return '';
+        }
+        const value = reply.headers.get(name);
+        return value === undefined || value === null ? '' : String(value);
+    } catch (err) {
+        return '';
+    }
+}
+
+function responseHeaders(reply, name) {
+    try {
+        if (!reply || !reply.headers || typeof reply.headers.getAll !== 'function') {
+            return [];
+        }
+        const values = reply.headers.getAll(name);
+        if (Array.isArray(values)) {
+            return values.map(String).filter(Boolean);
+        }
+        return values === undefined || values === null ? [] : [String(values)];
+    } catch (err) {
+        return [];
+    }
+}
+
+function applyDecisionHeaders(r, reply) {
+    const single = {
+        'WWW-Authenticate': responseHeader(reply, 'www-authenticate'),
+        Location: responseHeader(reply, 'location'),
+        'Retry-After': responseHeader(reply, 'retry-after'),
+        'X-CheeseWAF-Decision': responseHeader(reply, 'x-cheesewaf-decision'),
+        'X-CheeseWAF-Request-ID': responseHeader(reply, 'x-cheesewaf-request-id'),
+    };
+    for (const [name, value] of Object.entries(single)) {
+        if (value) {
+            r.headersOut[name] = value;
+        }
+    }
+    const cookies = responseHeaders(reply, 'set-cookie');
+    if (cookies.length) {
+        r.headersOut['Set-Cookie'] = cookies;
+    }
+}
+
+async function decisionBody(reply) {
+    try {
+        if (!reply || typeof reply.text !== 'function') {
+            return '';
+        }
+        return await reply.text();
+    } catch (err) {
+        return '';
+    }
+}
+
+function defaultDecisionBody(status) {
+    if (status === 413) {
+        return 'request body exceeds inspection limit\n';
+    }
+    if (status === 429) {
+        return 'request limited\n';
+    }
+    return 'request blocked\n';
+}
+
 async function check(r) {
     const method = String(r.method || '').toUpperCase();
     if (INSPECTED_METHODS.indexOf(method) === -1) {
@@ -143,6 +215,8 @@ async function check(r) {
         DEFAULT_TIMEOUT_MS,
         MAX_TIMEOUT_MS
     );
+    const deadline = Date.now() + timeoutMs;
+    const remaining = () => Math.max(1, deadline - Date.now());
 
     const declared = parseContentLength(r.headersIn['Content-Length']);
     if (Number.isNaN(declared)) {
@@ -159,7 +233,7 @@ async function check(r) {
 
     let raw;
     try {
-        raw = await withTimeout(r.readRequestArrayBuffer(), timeoutMs, 'request body read');
+        raw = await withTimeout(r.readRequestArrayBuffer(), remaining(), 'request body read');
     } catch (err) {
         denyUnavailable(r, 'request body read failed: ' + (err && err.message ? err.message : err));
         return;
@@ -199,7 +273,7 @@ async function check(r) {
                 body: Buffer.from(raw),
                 max_response_body_size: 4096,
             }),
-            timeoutMs,
+            remaining(),
             'body-check request'
         );
     } catch (err) {
@@ -207,18 +281,22 @@ async function check(r) {
         return;
     }
 
-    if (reply.status >= 200 && reply.status < 300) {
+    const status = Number(reply.status);
+    if (!Number.isFinite(status)) {
+        denyUnavailable(r, 'body-check returned an invalid status');
         return;
     }
-    if (reply.status === 403) {
-        r.return(403, 'request blocked\n');
+    if (status >= 200 && status < 300) {
+        applyDecisionHeaders(r, reply);
         return;
     }
-    if (reply.status === 413) {
-        r.return(413, 'request body exceeds inspection limit\n');
+    if (status >= 400 && status < 500) {
+        applyDecisionHeaders(r, reply);
+        const body = await decisionBody(reply);
+        r.return(status, body || defaultDecisionBody(status));
         return;
     }
-    denyUnavailable(r, 'body-check returned status ' + reply.status);
+    denyUnavailable(r, 'body-check returned status ' + status);
 }
 
 export default { check };

@@ -51,6 +51,7 @@ function harness({
             }
             return arrayBufferOf(body);
         },
+        headersOut: {},
         return: (status, text) => {
             calls.returns.push({ status, text });
         },
@@ -308,4 +309,75 @@ test('the adapter token is sent from the environment and never in the URL', asyn
             process.env.CHEESEWAF_ADAPTER_TOKEN = previous;
         }
     }
+});
+
+function replyWith(status, headers = {}, body = '') {
+    const values = new Map();
+    for (const [key, value] of Object.entries(headers)) {
+        values.set(key.toLowerCase(), Array.isArray(value) ? value.map(String) : [String(value)]);
+    }
+    return {
+        status,
+        headers: {
+            get(name) {
+                const found = values.get(String(name).toLowerCase());
+                return found && found.length ? found[0] : null;
+            },
+            getAll(name) {
+                return values.get(String(name).toLowerCase()) || [];
+            },
+        },
+        text: async () => body,
+    };
+}
+
+test('Content-Encoding is forwarded to the adapter', async () => {
+    await withoutAdapterToken(async () => {
+        const { r, calls } = harness({
+            headers: { 'Content-Encoding': 'gzip' },
+        });
+        await check(r);
+        assert.equal(calls.fetches[0].options.headers['Content-Encoding'], 'gzip');
+    });
+});
+
+test('challenge headers and body are propagated to the client', async () => {
+    await withoutAdapterToken(async () => {
+        const { r, calls } = harness({
+            fetch: async () => replyWith(401, {
+                'WWW-Authenticate': 'Basic realm="waf"',
+                'Set-Cookie': ['cw=1; Path=/; HttpOnly', 'theme=dark; Path=/'],
+                Location: '/login',
+                'Retry-After': '3',
+                'X-CheeseWAF-Decision': 'challenge',
+                'X-CheeseWAF-Request-ID': 'req-9',
+            }, 'verify'),
+        });
+        await check(r);
+        assert.equal(calls.returns.length, 1);
+        assert.equal(calls.returns[0].status, 401);
+        assert.equal(calls.returns[0].text, 'verify');
+        assert.equal(r.headersOut['WWW-Authenticate'], 'Basic realm="waf"');
+        assert.deepEqual(r.headersOut['Set-Cookie'], ['cw=1; Path=/; HttpOnly', 'theme=dark; Path=/']);
+        assert.equal(r.headersOut.Location, '/login');
+        assert.equal(r.headersOut['Retry-After'], '3');
+        assert.equal(r.headersOut['X-CheeseWAF-Decision'], 'challenge');
+        assert.equal(r.headersOut['X-CheeseWAF-Request-ID'], 'req-9');
+    });
+});
+
+test('a 429 block is preserved with retry-after', async () => {
+    await withoutAdapterToken(async () => {
+        const { r, calls } = harness({
+            fetch: async () => replyWith(429, {
+                'Retry-After': '1',
+                'X-CheeseWAF-Decision': 'block',
+            }, ''),
+        });
+        await check(r);
+        assert.equal(calls.returns.length, 1);
+        assert.equal(calls.returns[0].status, 429);
+        assert.equal(calls.returns[0].text, 'request limited\n');
+        assert.equal(r.headersOut['Retry-After'], '1');
+    });
 });
