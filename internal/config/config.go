@@ -19,6 +19,10 @@ type Config struct {
 	CoreTelemetryPath       string
 	CoreHealthPath          string
 	CoreToken               string
+	CoreTLSCAFile           string
+	CoreTLSCertFile         string
+	CoreTLSKeyFile          string
+	CoreTLSServerName       string
 	AdapterToken            string
 	RequestTimeout          time.Duration
 	TelemetryTimeout        time.Duration
@@ -62,6 +66,10 @@ func FromEnv() (Config, error) {
 		cfg.CoreHealthPath = strings.TrimSpace(value)
 	}
 	readString("CHEESEWAF_CORE_TOKEN", &cfg.CoreToken)
+	readString("CHEESEWAF_CORE_TLS_CA_FILE", &cfg.CoreTLSCAFile)
+	readString("CHEESEWAF_CORE_TLS_CERT_FILE", &cfg.CoreTLSCertFile)
+	readString("CHEESEWAF_CORE_TLS_KEY_FILE", &cfg.CoreTLSKeyFile)
+	readString("CHEESEWAF_CORE_TLS_SERVER_NAME", &cfg.CoreTLSServerName)
 	readString("CHEESEWAF_ADAPTER_TOKEN", &cfg.AdapterToken)
 	readString("CHEESEWAF_ADAPTER_FAIL_MODE", &cfg.FailMode)
 	if raw := strings.TrimSpace(os.Getenv("CHEESEWAF_ADAPTER_REQUEST_TIMEOUT")); raw != "" {
@@ -137,6 +145,9 @@ func (c Config) Validate() error {
 	}
 	if c.CoreToken != "" && !validSecret(c.CoreToken) {
 		return fmt.Errorf("core token contains invalid header characters")
+	}
+	if (c.CoreTLSCertFile == "") != (c.CoreTLSKeyFile == "") {
+		return fmt.Errorf("core TLS certificate and key must be configured together")
 	}
 	if c.AdapterToken != "" && !validSecret(c.AdapterToken) {
 		return fmt.Errorf("adapter token contains invalid header characters")

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -129,6 +131,41 @@ func New(cfg Config) (*Client, error) {
 		httpClient:    client,
 		maxResponse:   maxResponse,
 	}, nil
+}
+
+// LoadTLSConfig builds the core client TLS configuration from optional CA and
+// client-certificate files. An empty set of paths returns nil, meaning "use
+// the system defaults".
+func LoadTLSConfig(caFile, certFile, keyFile, serverName string) (*tls.Config, error) {
+	if caFile == "" && certFile == "" && keyFile == "" && serverName == "" {
+		return nil, nil
+	}
+	if (certFile == "") != (keyFile == "") {
+		return nil, fmt.Errorf("core TLS certificate and key must be configured together")
+	}
+	config := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		ServerName: serverName,
+	}
+	if caFile != "" {
+		pemData, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("read core TLS CA: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pemData) {
+			return nil, fmt.Errorf("no certificates found in core TLS CA file")
+		}
+		config.RootCAs = pool
+	}
+	if certFile != "" {
+		certificate, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load core TLS client certificate: %w", err)
+		}
+		config.Certificates = []tls.Certificate{certificate}
+	}
+	return config, nil
 }
 
 func validHeaderValue(value string) bool {

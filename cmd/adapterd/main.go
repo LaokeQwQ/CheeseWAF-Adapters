@@ -36,12 +36,22 @@ func main() {
 		fail(err)
 	}
 
+	tlsConfig, err := coreclient.LoadTLSConfig(
+		cfg.CoreTLSCAFile,
+		cfg.CoreTLSCertFile,
+		cfg.CoreTLSKeyFile,
+		cfg.CoreTLSServerName,
+	)
+	if err != nil {
+		fail(err)
+	}
 	core, err := coreclient.New(coreclient.Config{
 		BaseURL:       cfg.CoreURL,
 		InspectPath:   cfg.CoreInspectPath,
 		TelemetryPath: cfg.CoreTelemetryPath,
 		HealthPath:    cfg.CoreHealthPath,
 		Token:         cfg.CoreToken,
+		TLSConfig:     tlsConfig,
 	})
 	if err != nil {
 		fail(err)

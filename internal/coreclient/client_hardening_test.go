@@ -116,3 +116,25 @@ func TestEmitTelemetryDisabledReturnsSentinel(t *testing.T) {
 		t.Fatalf("error = %v, want ErrTelemetryDisabled", err)
 	}
 }
+
+func TestLoadTLSConfigEmptyReturnsNil(t *testing.T) {
+	config, err := LoadTLSConfig("", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config != nil {
+		t.Fatalf("config = %+v, want nil", config)
+	}
+}
+
+func TestLoadTLSConfigRejectsPartialClientPair(t *testing.T) {
+	if _, err := LoadTLSConfig("", "/tmp/cert.pem", "", ""); err == nil {
+		t.Fatal("partial client certificate pair unexpectedly accepted")
+	}
+}
+
+func TestLoadTLSConfigRejectsMissingCA(t *testing.T) {
+	if _, err := LoadTLSConfig("/tmp/does-not-exist-ca.pem", "", "", "core.example"); err == nil {
+		t.Fatal("missing CA file unexpectedly accepted")
+	}
+}
