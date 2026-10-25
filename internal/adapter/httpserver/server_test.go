@@ -82,7 +82,11 @@ func TestAuthzDoesNotForwardSensitiveHeadersByDefault(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodGet, "http://adapter/nginx/auth", nil)
 	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("X-Original-Method", http.MethodGet)
 	req.Header.Set("X-Original-URI", "/")
+	req.Header.Set("X-Forwarded-Host", "adapter")
+	req.Header.Set("X-Forwarded-Proto", "http")
+	req.Header.Set("X-Real-IP", "203.0.113.10")
 	req.Header.Set("Authorization", "Bearer secret")
 	resp := httptest.NewRecorder()
 	server.Handler().ServeHTTP(resp, req)
@@ -191,23 +195,19 @@ func TestTrustedForwardedMetadataCannotBeEmpty(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "http://adapter/v1/authz", nil)
 		req.RemoteAddr = "127.0.0.1:1234"
 		req.Header.Set(header, "   ")
-		if _, err := requestFromGateway(req, inspectionv1.SourceGeneric, cfg); err == nil {
+		if _, err := requestFromGateway(req, inspectionv1.SourceGeneric, cfg, false); err == nil {
 			t.Errorf("empty trusted %s unexpectedly accepted", header)
 		}
 	}
 }
 
-func TestTrustedForwardedChainFallsBackToLeftmostAddress(t *testing.T) {
+func TestTrustedForwardedChainAmbiguousAddressRejected(t *testing.T) {
 	cfg := config.Default()
 	req := httptest.NewRequest(http.MethodGet, "http://adapter/v1/authz", nil)
 	req.RemoteAddr = "127.0.0.1:1234"
 	req.Header.Set("X-Forwarded-For", "127.0.0.1, 127.0.0.1")
-	request, err := requestFromGateway(req, inspectionv1.SourceGeneric, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if request.Client.IP != "127.0.0.1" {
-		t.Fatalf("fully trusted chain client IP=%q, want leftmost address", request.Client.IP)
+	if _, err := requestFromGateway(req, inspectionv1.SourceGeneric, cfg, false); err == nil {
+		t.Fatal("ambiguous fully trusted XFF chain unexpectedly accepted")
 	}
 }
 
@@ -308,6 +308,11 @@ func TestEnvoyPartialBodyMarkerIsForwardedAsTruncated(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "http://adapter/envoy/check", bytes.NewBufferString("body"))
 	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Original-Method", http.MethodPost)
+	req.Header.Set("X-Original-URI", "/upload")
+	req.Header.Set("X-Forwarded-Host", "app.example")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Real-IP", "203.0.113.10")
 	req.Header.Set("X-Envoy-Auth-Partial-Body", "true")
 	resp := httptest.NewRecorder()
 	server.Handler().ServeHTTP(resp, req)
@@ -493,6 +498,8 @@ func TestNginxBodyCheckForwardsBoundedBody(t *testing.T) {
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("X-Original-Method", http.MethodPost)
 	req.Header.Set("X-Original-URI", "/upload")
+	req.Header.Set("X-Forwarded-Host", "app.example")
+	req.Header.Set("X-Forwarded-Proto", "https")
 	req.Header.Set("X-Real-IP", "203.0.113.10")
 	resp := httptest.NewRecorder()
 	server.Handler().ServeHTTP(resp, req)

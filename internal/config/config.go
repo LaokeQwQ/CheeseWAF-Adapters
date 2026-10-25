@@ -22,6 +22,7 @@ type Config struct {
 	AdapterToken            string
 	RequestTimeout          time.Duration
 	TelemetryTimeout        time.Duration
+	HealthCheckTimeout      time.Duration
 	MaxBodyBytes            int64
 	FailMode                string
 	ForwardBody             bool
@@ -39,6 +40,7 @@ func Default() Config {
 		CoreHealthPath:          "/healthz",
 		RequestTimeout:          100 * time.Millisecond,
 		TelemetryTimeout:        500 * time.Millisecond,
+		HealthCheckTimeout:      2 * time.Second,
 		MaxBodyBytes:            64 * 1024,
 		FailMode:                "closed",
 		ForwardBody:             false,
@@ -75,6 +77,13 @@ func FromEnv() (Config, error) {
 			return Config{}, fmt.Errorf("parse CHEESEWAF_ADAPTER_TELEMETRY_TIMEOUT: %w", err)
 		}
 		cfg.TelemetryTimeout = value
+	}
+	if raw := strings.TrimSpace(os.Getenv("CHEESEWAF_ADAPTER_HEALTH_TIMEOUT")); raw != "" {
+		value, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse CHEESEWAF_ADAPTER_HEALTH_TIMEOUT: %w", err)
+		}
+		cfg.HealthCheckTimeout = value
 	}
 	if raw := strings.TrimSpace(os.Getenv("CHEESEWAF_ADAPTER_MAX_BODY_BYTES")); raw != "" {
 		value, err := strconv.ParseInt(raw, 10, 64)
@@ -141,8 +150,11 @@ func (c Config) Validate() error {
 			return fmt.Errorf("%s must start with /", name)
 		}
 	}
-	if c.RequestTimeout <= 0 || c.TelemetryTimeout <= 0 {
+	if c.RequestTimeout <= 0 || c.TelemetryTimeout <= 0 || c.HealthCheckTimeout <= 0 {
 		return fmt.Errorf("timeouts must be positive")
+	}
+	if c.HealthCheckTimeout > 10*time.Second {
+		return fmt.Errorf("health check timeout must not exceed 10s")
 	}
 	if c.MaxBodyBytes < 0 {
 		return fmt.Errorf("max body bytes must be non-negative")

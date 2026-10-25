@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -16,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	inspectionv1 "github.com/LaokeQwQ/CheeseWAF-Adapters/contracts/inspection/v1"
 	"github.com/LaokeQwQ/CheeseWAF-Adapters/internal/config"
@@ -30,8 +32,8 @@ const (
 	maxAuthorityBytes    = 4 * 1024
 	maxPathBytes         = 16 * 1024
 	maxQueryBytes        = 64 * 1024
-	maxResponseHeaders   = 32
-	maxResponseHeadBytes = 16 * 1024
+	maxResponseHeaders   = 64
+	maxResponseHeadBytes = 64 * 1024
 	maxTelemetryPerSec   = 100
 	maxTelemetryBytes    = 256 * 1024
 )
@@ -39,6 +41,7 @@ const (
 type Server struct {
 	cfg            config.Config
 	core           *coreclient.Client
+	logger         *slog.Logger
 	readyMu        sync.Mutex
 	readyAt        time.Time
 	readyOK        bool
@@ -54,7 +57,7 @@ func New(cfg config.Config, core *coreclient.Client) (*Server, error) {
 	if core == nil {
 		return nil, errors.New("core client is required")
 	}
-	return &Server{cfg: cfg, core: core}, nil
+	return &Server{cfg: cfg, core: core, logger: slog.Default()}, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -96,15 +99,25 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) authz(w http.ResponseWriter, r *http.Request, source inspectionv1.Source) {
-	if r.Method != http.MethodGet && r.Method != http.MethodPost {
-		w.Header().Set("Allow", "GET, POST")
+	s.handleAuthz(w, r, source, false)
+}
+
+func (s *Server) handleAuthz(w http.ResponseWriter, r *http.Request, source inspectionv1.Source, bodyRequired bool) {
+	if !validGatewayMethod(r.Method) {
+		w.Header().Set("Allow", "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
 
-	request, err := requestFromGateway(r, source, s.cfg)
+	request, err := requestFromGateway(r, source, s.cfg, bodyRequired)
 	if err != nil {
-		s.writeClosedFailure(w)
+		s.logger.Warn("gateway request rejected", "source", source, "error", err)
+		s.writeBadRequest(w)
+		return
+	}
+	if bodyRequired && len(request.Body) == 0 && !request.BodyTruncated {
+		s.logger.Warn("body inspection request has no body", "source", source, "request_id", request.RequestID)
+		s.writeBadRequest(w)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout)
@@ -115,13 +128,15 @@ func (s *Server) authz(w http.ResponseWriter, r *http.Request, source inspection
 		// transport fail-open turn it into an implicit allow; the gateway must
 		// retry/reject the request instead.
 		if request.BodyTruncated {
+			s.logger.Warn("body inspection truncated; refusing decision", "source", source, "request_id", request.RequestID)
 			s.writeBodyLimitFailure(w)
 			return
 		}
-		s.writeFailure(w, err, request.Source)
+		s.writeFailure(w, err, request.Source, request.RequestID)
 		return
 	}
 	if request.BodyTruncated && (decision.Action == inspectionv1.ActionAllow || decision.Action == inspectionv1.ActionLog) {
+		s.logger.Warn("body inspection truncated; refusing allow", "source", source, "request_id", request.RequestID)
 		s.writeBodyLimitFailure(w)
 		return
 	}
@@ -138,7 +153,7 @@ func (s *Server) nginxBodyCheck(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "body inspection is disabled"})
 		return
 	}
-	s.authz(w, r, inspectionv1.SourceNginxAuth)
+	s.handleAuthz(w, r, inspectionv1.SourceNginxAuth, true)
 }
 
 func (s *Server) telemetry(w http.ResponseWriter, r *http.Request) {
@@ -147,9 +162,8 @@ func (s *Server) telemetry(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	if !s.allowTelemetry(time.Now()) {
-		w.Header().Set("Retry-After", "1")
-		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "telemetry rate limit exceeded"})
+	if strings.TrimSpace(s.cfg.CoreTelemetryPath) == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "telemetry is disabled"})
 		return
 	}
 	var event coreclient.TelemetryEvent
@@ -163,8 +177,19 @@ func (s *Server) telemetry(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "telemetry payload must contain one JSON object"})
 		return
 	}
+	if event.ContractVersion == "" {
+		event.ContractVersion = inspectionv1.Version
+	}
+	if event.Source == "" {
+		event.Source = inspectionv1.SourceGeneric
+	}
 	if err := event.Validate(); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid telemetry payload"})
+		return
+	}
+	if !s.allowTelemetry(time.Now()) {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "telemetry rate limit exceeded"})
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.TelemetryTimeout)
@@ -172,14 +197,16 @@ func (s *Server) telemetry(w http.ResponseWriter, r *http.Request) {
 	if err := s.core.EmitTelemetry(ctx, event); err != nil {
 		// Telemetry is intentionally best effort. It must not turn an already
 		// completed gateway decision into a request failure.
+		s.logger.Warn("telemetry delivery failed", "source", event.Source, "request_id", event.RequestID, "error", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "telemetry unavailable"})
 		return
 	}
 	w.WriteHeader(http.StatusAccepted)
 }
 
-func (s *Server) writeFailure(w http.ResponseWriter, err error, source inspectionv1.Source) {
+func (s *Server) writeFailure(w http.ResponseWriter, err error, source inspectionv1.Source, requestID string) {
 	if s.cfg.FailMode == "open" && coreclient.IsTransportError(err) && !coreclient.IsProtocolError(err) {
+		s.logger.Warn("core inspection unavailable; failing open", "source", source, "request_id", requestID, "error", err)
 		w.Header().Set("X-CheeseWAF-Adapter-Error", "core-unavailable")
 		if source == inspectionv1.SourceEnvoyAuth || source == inspectionv1.SourceEnvoyExtProc {
 			w.WriteHeader(http.StatusOK)
@@ -188,7 +215,12 @@ func (s *Server) writeFailure(w http.ResponseWriter, err error, source inspectio
 		}
 		return
 	}
+	s.logger.Warn("core inspection failed; failing closed", "source", source, "request_id", requestID, "error", err)
 	s.writeClosedFailure(w)
+}
+
+func (s *Server) writeBadRequest(w http.ResponseWriter) {
+	writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid gateway request"})
 }
 
 func (s *Server) writeClosedFailure(w http.ResponseWriter) {
@@ -206,30 +238,48 @@ func (s *Server) writeBodyLimitFailure(w http.ResponseWriter) {
 func (s *Server) writeDecision(w http.ResponseWriter, decision inspectionv1.Decision, requestID string, source inspectionv1.Source) {
 	decision = decision.Normalized()
 	if err := decision.Validate(); err != nil {
+		s.logger.Warn("invalid core decision", "source", source, "request_id", requestID, "error", err)
 		s.writeClosedFailure(w)
 		return
 	}
-	responseHeaders := make(map[string]string, len(decision.Headers))
 	totalHeaderBytes := 0
+	headerCount := 0
 	for key, value := range decision.Headers {
 		canonical, ok := validResponseHeader(key)
-		if !ok || len(value) > maxHeaderValueBytes || strings.ContainsAny(value, "\r\n") || strings.IndexFunc(value, func(r rune) bool { return r < ' ' || r == 127 }) >= 0 {
+		if !ok {
+			s.logger.Warn("dropping unsupported decision header", "source", source, "request_id", requestID, "header", key)
+			continue
+		}
+		if !validResponseHeaderValue(value) {
+			s.logger.Warn("dropping invalid decision header", "source", source, "request_id", requestID, "header", key)
+			continue
+		}
+		if headerCount >= maxResponseHeaders || totalHeaderBytes+len(canonical)+len(value) > maxResponseHeadBytes {
+			s.logger.Warn("decision headers exceed adapter limits", "source", source, "request_id", requestID)
 			s.writeClosedFailure(w)
 			return
 		}
-		if len(responseHeaders) >= maxResponseHeaders || totalHeaderBytes+len(canonical)+len(value) > maxResponseHeadBytes {
-			s.writeClosedFailure(w)
-			return
+		if strings.EqualFold(canonical, "Set-Cookie") {
+			w.Header().Add(canonical, value)
+		} else {
+			w.Header().Set(canonical, value)
 		}
-		if _, exists := responseHeaders[canonical]; exists {
-			s.writeClosedFailure(w)
-			return
-		}
-		responseHeaders[canonical] = value
+		headerCount++
 		totalHeaderBytes += len(canonical) + len(value)
 	}
-	for key, value := range responseHeaders {
-		w.Header().Set(key, value)
+	for _, cookie := range decision.SetCookies {
+		if !validResponseHeaderValue(cookie) {
+			s.logger.Warn("dropping invalid set-cookie", "source", source, "request_id", requestID)
+			continue
+		}
+		if headerCount >= maxResponseHeaders || totalHeaderBytes+len("Set-Cookie")+len(cookie) > maxResponseHeadBytes {
+			s.logger.Warn("decision cookies exceed adapter limits", "source", source, "request_id", requestID)
+			s.writeClosedFailure(w)
+			return
+		}
+		w.Header().Add("Set-Cookie", cookie)
+		headerCount++
+		totalHeaderBytes += len("Set-Cookie") + len(cookie)
 	}
 	w.Header().Set("X-CheeseWAF-Decision", string(decision.Action))
 	if requestID != "" {
@@ -246,6 +296,17 @@ func (s *Server) writeDecision(w http.ResponseWriter, decision inspectionv1.Deci
 		status := decision.StatusCode
 		if status == 0 {
 			status = http.StatusForbidden
+		}
+		if len(decision.Body) > 0 {
+			if !validResponseContentType(decision.BodyContentType) {
+				s.logger.Warn("invalid decision body content type", "source", source, "request_id", requestID, "content_type", decision.BodyContentType)
+				s.writeClosedFailure(w)
+				return
+			}
+			w.Header().Set("Content-Type", decision.BodyContentType)
+			w.WriteHeader(status)
+			_, _ = w.Write(decision.Body)
+			return
 		}
 		w.WriteHeader(status)
 	default:
@@ -282,15 +343,18 @@ func (s *Server) coreReady(ctx context.Context) bool {
 		return s.readyOK
 	}
 
-	probeTimeout := s.cfg.RequestTimeout
-	if probeTimeout > 500*time.Millisecond {
-		probeTimeout = 500 * time.Millisecond
+	probeTimeout := s.cfg.HealthCheckTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = 2 * time.Second
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	if probeTimeout > 5*time.Second {
+		probeTimeout = 5 * time.Second
+	}
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), probeTimeout)
 	err := s.core.Ready(probeCtx)
 	cancel()
 
-	s.readyAt = now
+	s.readyAt = time.Now()
 	s.readyOK = err == nil
 	return err == nil
 }
@@ -309,8 +373,13 @@ func (s *Server) allowTelemetry(now time.Time) bool {
 	return true
 }
 
-func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.Config) (inspectionv1.Request, error) {
+func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.Config, bodyRequired bool) (inspectionv1.Request, error) {
 	trusted := trustedPeer(r.RemoteAddr, cfg.TrustedProxyCIDRs)
+	gatewaySource := source == inspectionv1.SourceNginxAuth || source == inspectionv1.SourceEnvoyAuth || source == inspectionv1.SourceEnvoyExtProc
+	if gatewaySource && !trusted {
+		return inspectionv1.Request{}, fmt.Errorf("gateway metadata requires a trusted proxy")
+	}
+
 	requestID := ""
 	if trusted {
 		raw, present, err := singleHeader(r.Header, "X-Request-ID")
@@ -327,6 +396,7 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 	if requestID == "" {
 		requestID = newRequestID()
 	}
+
 	pathValue := ""
 	method := r.Method
 	clientIP := remoteIP(r.RemoteAddr)
@@ -344,12 +414,16 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 				return inspectionv1.Request{}, err
 			}
 		}
+		if gatewaySource && !uriPresent {
+			return inspectionv1.Request{}, fmt.Errorf("missing original URI")
+		}
 		if uriPresent {
 			if strings.TrimSpace(rawURI) == "" {
 				return inspectionv1.Request{}, fmt.Errorf("invalid original URI")
 			}
 			pathValue = rawURI
 		}
+
 		rawMethod, methodPresent, err := singleHeader(r.Header, "X-Original-Method")
 		if err != nil {
 			return inspectionv1.Request{}, err
@@ -360,6 +434,9 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 				return inspectionv1.Request{}, err
 			}
 		}
+		if gatewaySource && !methodPresent {
+			return inspectionv1.Request{}, fmt.Errorf("missing original method")
+		}
 		if methodPresent {
 			originalMethod := strings.TrimSpace(rawMethod)
 			if originalMethod == "" {
@@ -367,6 +444,7 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 			}
 			method = originalMethod
 		}
+
 		if source == inspectionv1.SourceEnvoyAuth || source == inspectionv1.SourceEnvoyExtProc {
 			rawPartial, partialPresent, err := singleHeader(r.Header, "X-Envoy-Auth-Partial-Body")
 			if err != nil {
@@ -383,6 +461,7 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 				}
 			}
 		}
+
 		rawRealIP, realPresent, err := singleHeader(r.Header, "X-Real-IP")
 		if err != nil {
 			return inspectionv1.Request{}, err
@@ -392,21 +471,27 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 			return inspectionv1.Request{}, err
 		}
 		if xffPresent {
-			if forwardedIP := forwardedClientIP(rawXFF, cfg.TrustedProxyCIDRs); forwardedIP != "" {
-				clientIP = forwardedIP
-			} else {
+			forwardedIP := forwardedClientIP(rawXFF, cfg.TrustedProxyCIDRs)
+			if forwardedIP == "" {
 				return inspectionv1.Request{}, fmt.Errorf("invalid X-Forwarded-For")
 			}
+			clientIP = forwardedIP
 		} else if realPresent {
-			if forwardedIP := validForwardedIP(rawRealIP); forwardedIP != "" {
-				clientIP = forwardedIP
-			} else {
+			forwardedIP := validForwardedIP(rawRealIP)
+			if forwardedIP == "" {
 				return inspectionv1.Request{}, fmt.Errorf("invalid X-Real-IP")
 			}
+			clientIP = forwardedIP
+		} else if gatewaySource {
+			return inspectionv1.Request{}, fmt.Errorf("missing client address metadata")
 		}
+
 		rawHost, hostPresent, err := singleHeader(r.Header, "X-Forwarded-Host")
 		if err != nil {
 			return inspectionv1.Request{}, err
+		}
+		if gatewaySource && !hostPresent {
+			return inspectionv1.Request{}, fmt.Errorf("missing forwarded host")
 		}
 		if hostPresent {
 			forwardedHostRaw, ok := singleForwardedValue(rawHost)
@@ -416,9 +501,13 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 			}
 			authority = forwardedHost
 		}
+
 		rawScheme, schemePresent, err := singleHeader(r.Header, "X-Forwarded-Proto")
 		if err != nil {
 			return inspectionv1.Request{}, err
+		}
+		if gatewaySource && !schemePresent {
+			return inspectionv1.Request{}, fmt.Errorf("missing forwarded scheme")
 		}
 		if schemePresent {
 			forwardedSchemeRaw, ok := singleForwardedValue(rawScheme)
@@ -429,7 +518,11 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 			scheme = forwardedSchemeValue
 		}
 	}
+
 	if pathValue == "" {
+		if gatewaySource {
+			return inspectionv1.Request{}, fmt.Errorf("missing original URI")
+		}
 		pathValue = r.URL.RequestURI()
 	}
 	path, query, err := parseRequestURI(pathValue)
@@ -439,13 +532,17 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 	if !validGatewayMethod(method) {
 		return inspectionv1.Request{}, fmt.Errorf("invalid gateway method %q", method)
 	}
+	authorityValue := safeAuthority(authority)
+	if authorityValue == "" {
+		return inspectionv1.Request{}, fmt.Errorf("invalid request authority")
+	}
 	request := inspectionv1.Request{
 		ContractVersion: inspectionv1.Version,
 		RequestID:       requestID,
 		Source:          source,
 		Method:          method,
 		Scheme:          scheme,
-		Authority:       safeAuthority(authority),
+		Authority:       authorityValue,
 		Path:            path,
 		Query:           query,
 		Headers:         nil,
@@ -454,9 +551,6 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 			UserAgent: "",
 		},
 		ObservedAt: time.Now().UTC(),
-	}
-	if request.Authority == "" {
-		return inspectionv1.Request{}, fmt.Errorf("invalid request authority")
 	}
 	if rawUserAgent, present, err := singleHeader(r.Header, "User-Agent"); err != nil {
 		return inspectionv1.Request{}, err
@@ -476,25 +570,65 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 		if err != nil {
 			return inspectionv1.Request{}, fmt.Errorf("read request body: %w", err)
 		}
-		request.Body = body
-		request.BodyTruncated = truncated || envoyPartialBody
-		request.BodyForwarded = true
-	} else if err := rejectUnexpectedBody(r); err != nil {
-		return inspectionv1.Request{}, err
+		truncated = truncated || envoyPartialBody
+		switch {
+		case truncated:
+			request.BodyState = inspectionv1.BodyStateTruncated
+			request.BodyForwarded = true
+			request.BodyTruncated = true
+			request.Body = body
+		case len(body) > 0 || bodyRequired || source == inspectionv1.SourceGeneric:
+			request.BodyState = inspectionv1.BodyStateForwarded
+			request.BodyForwarded = true
+			request.Body = body
+		default:
+			request.BodyState = inspectionv1.BodyStateWithheld
+		}
+		if request.BodyForwarded {
+			encoding, err := requestBodyEncoding(r.Header)
+			if err != nil {
+				return inspectionv1.Request{}, err
+			}
+			request.BodyEncoding = encoding
+		}
+	} else {
+		if err := rejectUnexpectedBody(r); err != nil {
+			return inspectionv1.Request{}, err
+		}
+		if source == inspectionv1.SourceGeneric {
+			request.BodyState = inspectionv1.BodyStateAbsent
+		} else {
+			request.BodyState = inspectionv1.BodyStateWithheld
+		}
 	}
 	if envoyPartialBody && !cfg.ForwardBody {
 		// The v1 contract requires BodyTruncated to accompany a forwarded body;
 		// reject rather than silently presenting Envoy's partial input as whole.
 		return inspectionv1.Request{}, fmt.Errorf("Envoy request body is partial but body forwarding is disabled")
 	}
+	if err := request.Validate(); err != nil {
+		return inspectionv1.Request{}, fmt.Errorf("validate gateway request: %w", err)
+	}
 	return request, nil
+}
+
+func requestBodyEncoding(header http.Header) (string, error) {
+	raw := strings.TrimSpace(header.Get("Content-Encoding"))
+	if raw == "" {
+		return "", nil
+	}
+	encoding := strings.ToLower(raw)
+	if encoding == "identity" {
+		return "", nil
+	}
+	if !validHeaderToken(encoding) {
+		return "", fmt.Errorf("invalid Content-Encoding")
+	}
+	return encoding, nil
 }
 
 func rejectUnexpectedBody(r *http.Request) error {
 	if r.Body == nil || r.Body == http.NoBody {
-		return nil
-	}
-	if r.ContentLength == 0 {
 		return nil
 	}
 	if r.ContentLength > 0 {
@@ -527,6 +661,7 @@ func boundedBody(r *http.Request, maxBytes int64) ([]byte, bool, error) {
 
 func copiedHeaders(input http.Header, forwardSensitiveHeaders, forwardBody bool) (map[string][]string, error) {
 	output := make(map[string][]string)
+	connectionTokens := connectionHeaderTokens(input)
 	count := 0
 	totalBytes := 0
 	for key, values := range input {
@@ -537,14 +672,23 @@ func copiedHeaders(input http.Header, forwardSensitiveHeaders, forwardBody bool)
 		if canonical == "" || strings.HasPrefix(strings.ToLower(canonical), "x-cheesewaf-") || hopByHopHeader(canonical) {
 			continue
 		}
+		if _, nominated := connectionTokens[canonical]; nominated {
+			continue
+		}
 		if forwardedHeader(canonical) || canonical == "X-CheeseWAF-Adapter-Token" {
 			continue
 		}
-		if !forwardBody && bodyOnlyHeader(canonical) {
+		if canonical == "Content-Length" || canonical == "Content-Range" {
+			continue
+		}
+		if !forwardBody && canonical == "Content-Encoding" {
 			continue
 		}
 		if !forwardSensitiveHeaders && sensitiveHeader(canonical) {
 			continue
+		}
+		if isSingleValueHeader(canonical) && len(values) > 1 {
+			return nil, fmt.Errorf("request header %q must have a single value", canonical)
 		}
 		if count >= maxHeaderCount {
 			return nil, fmt.Errorf("request header count exceeds %d", maxHeaderCount)
@@ -554,8 +698,8 @@ func copiedHeaders(input http.Header, forwardSensitiveHeaders, forwardBody bool)
 			if len(value) > maxHeaderValueBytes {
 				return nil, fmt.Errorf("request header %q exceeds %d bytes", canonical, maxHeaderValueBytes)
 			}
-			if strings.ContainsAny(value, "\r\n") || strings.IndexFunc(value, func(r rune) bool { return r < ' ' || r == 127 }) >= 0 {
-				return nil, fmt.Errorf("request header %q contains control characters", canonical)
+			if !utf8.ValidString(value) || strings.ContainsAny(value, "\r\n") || strings.IndexFunc(value, func(r rune) bool { return r < ' ' || r == 127 }) >= 0 {
+				return nil, fmt.Errorf("request header %q contains invalid characters", canonical)
 			}
 			if totalBytes+len(canonical)+len(value) > maxHeaderBytes {
 				return nil, fmt.Errorf("request headers exceed %d bytes", maxHeaderBytes)
@@ -574,6 +718,31 @@ func copiedHeaders(input http.Header, forwardSensitiveHeaders, forwardBody bool)
 	return output, nil
 }
 
+func connectionHeaderTokens(input http.Header) map[string]struct{} {
+	tokens := make(map[string]struct{})
+	for _, value := range input.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			token = strings.TrimSpace(token)
+			if token == "" {
+				continue
+			}
+			tokens[http.CanonicalHeaderKey(token)] = struct{}{}
+		}
+	}
+	return tokens
+}
+
+func isSingleValueHeader(key string) bool {
+	switch strings.ToLower(key) {
+	case "content-type", "content-encoding", "content-length", "content-range",
+		"authorization", "proxy-authorization", "x-user", "x-email",
+		"x-http-method-override", "x-rewrite-url":
+		return true
+	default:
+		return false
+	}
+}
+
 func parseRequestURI(value string) (string, string, error) {
 	if value == "" {
 		return "/", "", nil
@@ -584,7 +753,10 @@ func parseRequestURI(value string) (string, string, error) {
 	if !strings.HasPrefix(value, "/") {
 		return "", "", fmt.Errorf("request URI must start with /")
 	}
-	if len(value) > maxPathBytes+maxQueryBytes+1 || strings.ContainsAny(value, "#\\\r\n") || strings.IndexFunc(value, func(r rune) bool { return r < ' ' || r == 127 }) >= 0 {
+	if !utf8.ValidString(value) {
+		return "", "", fmt.Errorf("request URI contains invalid UTF-8")
+	}
+	if len(value) > maxPathBytes+maxQueryBytes+1 || strings.ContainsAny(value, "#\\") || strings.IndexFunc(value, func(r rune) bool { return r <= ' ' || r == 127 }) >= 0 {
 		return "", "", fmt.Errorf("request URI exceeds adapter limits or contains control characters")
 	}
 	if index := strings.IndexByte(value, '?'); index >= 0 {
@@ -621,7 +793,10 @@ func validPercentEncoding(value string, rejectPathSeparators bool) bool {
 			return false
 		}
 		decoded := (hexValue(value[index+1]) << 4) | hexValue(value[index+2])
-		if decoded == 0 || (rejectPathSeparators && (decoded == '/' || decoded == '\\' || decoded == '.')) {
+		if decoded < ' ' || decoded == 127 {
+			return false
+		}
+		if rejectPathSeparators && (decoded == '/' || decoded == '\\' || decoded == '.') {
 			return false
 		}
 		index += 2
@@ -646,7 +821,7 @@ func hexValue(value byte) byte {
 
 func hasDotSegment(path string) bool {
 	for _, segment := range strings.Split(path, "/") {
-		if segment == "." || segment == ".." {
+		if segment == "." || segment == ".." || strings.HasPrefix(segment, "..;") || strings.HasPrefix(segment, ".;") {
 			return true
 		}
 	}
@@ -677,6 +852,7 @@ func trustedPeer(remote string, cidrs []string) bool {
 	if err != nil {
 		return false
 	}
+	addr = addr.Unmap()
 	for _, raw := range cidrs {
 		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
 		if err == nil && prefix.Contains(addr) {
@@ -720,10 +896,13 @@ func forwardedClientIP(value string, cidrs []string) string {
 			return candidate
 		}
 	}
-	// A fully trusted chain is valid but does not expose an external client
-	// address. Preserve the leftmost asserted address instead of treating the
-	// complete chain as malformed; the caller still knows the peer was trusted.
-	return leftmost
+	// A fully trusted chain with more than one address is ambiguous: the
+	// leftmost value may be client-controlled. Only a single trusted address
+	// can be trusted as the gateway's asserted client identity.
+	if len(parts) == 1 {
+		return leftmost
+	}
+	return ""
 }
 
 func trustedAddress(value string, cidrs []string) bool {
@@ -731,6 +910,7 @@ func trustedAddress(value string, cidrs []string) bool {
 	if err != nil {
 		return false
 	}
+	addr = addr.Unmap()
 	for _, raw := range cidrs {
 		prefix, err := netip.ParsePrefix(strings.TrimSpace(raw))
 		if err == nil && prefix.Contains(addr) {
@@ -742,21 +922,21 @@ func trustedAddress(value string, cidrs []string) bool {
 
 func safeHeaderText(value string, maxBytes int) string {
 	value = strings.TrimSpace(value)
-	if value == "" || len(value) > maxBytes || strings.ContainsAny(value, "\r\n") || strings.IndexFunc(value, func(r rune) bool { return r < ' ' || r == 127 }) >= 0 {
+	if value == "" || len(value) > maxBytes || !utf8.ValidString(value) || strings.ContainsAny(value, "\r\n") || strings.IndexFunc(value, func(r rune) bool { return r < ' ' || r == 127 }) >= 0 {
 		return ""
 	}
 	return value
 }
 
 func safeRequestID(value string) string {
-	if value == "" || strings.TrimSpace(value) != value || len(value) > maxRequestIDBytes || strings.ContainsAny(value, "\r\n") || strings.IndexFunc(value, func(r rune) bool { return r < ' ' || r == 127 }) >= 0 {
+	if value == "" || strings.TrimSpace(value) != value || len(value) > maxRequestIDBytes || !utf8.ValidString(value) || strings.ContainsAny(value, "\r\n") || strings.IndexFunc(value, func(r rune) bool { return r < ' ' || r == 127 }) >= 0 {
 		return ""
 	}
 	return value
 }
 
 func safeAuthority(value string) string {
-	if value == "" || strings.TrimSpace(value) != value || len(value) > maxAuthorityBytes || strings.ContainsAny(value, "\r\n/?#\\") || strings.IndexFunc(value, func(r rune) bool { return r < ' ' || r == 127 }) >= 0 {
+	if value == "" || strings.TrimSpace(value) != value || len(value) > maxAuthorityBytes || !utf8.ValidString(value) || strings.ContainsAny(value, "\r\n/?#\\@, ") || strings.IndexFunc(value, func(r rune) bool { return r < ' ' || r == 127 }) >= 0 {
 		return ""
 	}
 	return value
@@ -793,7 +973,7 @@ func forwardedHeader(key string) bool {
 
 func hopByHopHeader(key string) bool {
 	switch strings.ToLower(key) {
-	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade":
 		return true
 	default:
 		return false
@@ -814,18 +994,50 @@ func validResponseHeader(key string) (string, bool) {
 		return "", false
 	}
 	canonical := http.CanonicalHeaderKey(key)
-	if canonical == "" || canonical == "Connection" || canonical == "Transfer-Encoding" || canonical == "Content-Length" {
+	lower := strings.ToLower(canonical)
+	switch lower {
+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+		"te", "trailer", "transfer-encoding", "upgrade", "content-length", "content-range":
 		return "", false
 	}
-	lower := strings.ToLower(canonical)
-	if strings.HasPrefix(lower, "x-cheesewaf-") || canonical == "WWW-Authenticate" || canonical == "Retry-After" || canonical == "Location" {
+	if strings.HasPrefix(lower, "x-cheesewaf-") || lower == "www-authenticate" || lower == "retry-after" || lower == "location" || lower == "set-cookie" {
 		return canonical, true
 	}
 	return "", false
 }
 
+func validResponseHeaderValue(value string) bool {
+	return len(value) <= maxHeaderValueBytes &&
+		utf8.ValidString(value) &&
+		!strings.ContainsAny(value, "\r\n") &&
+		strings.IndexFunc(value, func(r rune) bool { return r < ' ' || r == 127 }) < 0
+}
+
+func validResponseContentType(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "text/plain", "text/plain; charset=utf-8",
+		"text/html", "text/html; charset=utf-8",
+		"application/json", "application/json; charset=utf-8":
+		return true
+	default:
+		return false
+	}
+}
+
+func validHeaderToken(value string) bool {
+	if value == "" || !utf8.ValidString(value) {
+		return false
+	}
+	for _, r := range value {
+		if r <= ' ' || r == 127 || strings.ContainsRune("()<>@,;:\\\"/[]?={}", r) {
+			return false
+		}
+	}
+	return true
+}
+
 func validHeaderName(key string) bool {
-	if key == "" {
+	if key == "" || !utf8.ValidString(key) {
 		return false
 	}
 	for _, r := range key {
