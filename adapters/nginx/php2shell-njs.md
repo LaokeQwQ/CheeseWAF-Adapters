@@ -40,8 +40,9 @@ access-phase pattern used by the official njs
   floor is 1.0.2.
 - NGINX built with `ngx_http_js_module` (static or dynamic). QuickJS
   (`js_engine qjs`) is the supported engine for njs 1.x.
-- adapterd reachable at the configured URL, with a `POST /nginx/body-check`
-  route. **That route is not implemented in this repository yet**; see
+- adapterd reachable at the configured URL, with the
+  `POST /nginx/body-check` route enabled by
+  `CHEESEWAF_ADAPTER_FORWARD_BODY=true`; see
   [Required adapterd contract](#required-adapterd-contract).
 - `client_body_buffer_size` at least as large as the inspection limit, and
   `client_max_body_size` larger than it.
@@ -126,17 +127,22 @@ curl -sS -o /dev/null -w '%{http_code}\n' \
   -H 'Content-Type: multipart/form-data; boundary=x' \
   -H 'X-Original-Method: POST' \
   -H 'X-Original-URI: /upload.php' \
+  -H 'X-Forwarded-Host: example.test' \
+  -H 'X-Forwarded-Proto: https' \
+  -H 'X-Real-IP: 203.0.113.10' \
   --data-binary $'--x\r\nContent-Disposition: form-data; name="PHPSESSID"\r\n\r\nx\r\n--x--\r\n' \
   http://127.0.0.1:9080/nginx/body-check
 ```
 
-Expected status: `204` (allow), `403` (deny), or `413` (body too large).
-`404`/`405` means the adapterd route is not installed. `401` means the
-adapter token is missing or wrong.
+Expected status: `204` (allow), `401` (challenge or bad adapter token),
+`403` (deny), `413` (body too large), or `429` (rate limited).
+`404`/`405` means the adapterd route is not installed. `503` means
+inspection is unavailable.
 
 Enable the handler only after that probe returns a decision status. The
-handler fails closed, so a missing or unreachable adapterd turns every
-POST/PUT/PATCH with a body into `503`.
+handler fails closed when adapterd is missing or unreachable. It does **not**
+override adapterd's `CHEESEWAF_ADAPTER_FAIL_MODE`; if that is set to `open`,
+a core outage allows the request. Keep `closed` for body inspection.
 
 ## Required adapterd contract
 
@@ -148,25 +154,23 @@ mapping:
 | Method and path | `POST /nginx/body-check` |
 | Body | Raw request bytes, at most the configured inspection limit |
 | `Content-Type` | Original client value, including the multipart boundary |
+| `Content-Encoding` | Original client value when present |
 | Metadata headers | `X-Original-Method`, `X-Original-URI`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`, `X-Request-ID` |
 | Optional auth | `X-CheeseWAF-Adapter-Token` |
 | Allow | Any `2xx` |
-| Deny | `403` |
+| Deny | Any `4xx` (normally `403`) |
+| Challenge | `401`, with `WWW-Authenticate`, `Set-Cookie`, and optional body |
 | Body too large | `413` |
+| Rate limited | `429`, with `Retry-After` |
 | Error/timeout | Any other status, or no response |
 
-The route is missing from `internal/adapter/httpserver/server.go`; that
-server currently registers `/nginx/auth`, `/envoy/check`, `/v1/authz`, and
-`/v1/telemetry` only. Until the route exists, this integration cannot return
-an allow decision. The route must:
-
-- require `POST` and a non-empty body;
-- bound the body with the same configured limit and return `413` before
-  calling the core when it is exceeded;
-- build an inspection request with `BodyForwarded=true` and the original
-  method/URI metadata;
-- forward the body only to the self-hosted core and never log it;
-- return status-based decisions, not a `200` JSON allow body.
+The route is implemented in `internal/adapter/httpserver/server.go`. It
+requires `POST`, `CHEESEWAF_ADAPTER_FORWARD_BODY=true`, and a non-empty
+request body. It builds an inspection request with `body_state=forwarded` or
+`body_state=truncated` and the original method/URI metadata. When the body
+exceeds the adapter limit, the prefix is still sent to the core marked
+truncated; an `allow`/`log` result becomes `413`, never an implicit allow.
+The body is forwarded only to the self-hosted core and is never logged.
 
 ## Privacy and limits
 
@@ -177,10 +181,13 @@ an allow decision. The route must:
 - The original URI, including its query string, is sent as metadata. Do not
   put credentials in query strings.
 - The body is held in memory by the access handler; `client_body_buffer_size`
-  must cover the inspection limit. Do not disable request buffering.
-- `$cheesewaf_body_check_timeout_ms` bounds both the body read and the
-  adapter call. The 2s default is ample for 64 KiB on normal links; raise it
-  for slow clients or larger limits.
+  must cover the inspection limit. The example uses 128 KiB, so raise it to
+  at least the configured limit if you increase the limit above 128 KiB. Do
+  not disable request buffering.
+- `$cheesewaf_body_check_timeout_ms` is one deadline covering both the body
+  read and the adapter call, not a separate budget for each. The 2s default
+  is ample for 64 KiB on normal links; raise it for slow clients or larger
+  limits.
 - The PHP2Shell detector is multipart-specific. The handler still forwards
   bounded non-multipart bodies when POST/PUT/PATCH is used; the core decides
   whether they are relevant.

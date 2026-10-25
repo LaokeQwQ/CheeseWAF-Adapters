@@ -9,17 +9,28 @@ http_filters:
       failure_mode_allow: false
       status_on_error: { code: ServiceUnavailable }
       validate_mutations: true
+      # Forward a bounded body so core body rules can run. The adapter marks
+      # Envoy's partial-body marker as body_state=truncated.
+      with_request_body:
+        max_request_bytes: 65536
+        allow_partial_message: true
       http_service:
         server_uri:
           uri: http://127.0.0.1:9080
           cluster: cheesewaf_adapter
-          timeout: 100ms
+          # Slightly above adapterd's default 100ms inline budget.
+          timeout: 150ms
         path_override: /envoy/check
         authorization_request:
           allowed_headers:
             patterns:
               - exact: x-request-id
               - exact: user-agent
+              - exact: content-type
+              - exact: content-encoding
+              - exact: accept
+              - exact: referer
+              - exact: origin
           headers_to_add:
             # path_override changes :path before the auth request is sent;
             # preserve the original method/path with Envoy's formatter.
@@ -39,6 +50,16 @@ http_filters:
         authorization_response:
           allowed_upstream_headers:
             patterns:
+              - exact: x-cheesewaf-decision
+              - exact: x-cheesewaf-request-id
+          # Challenge/block responses to the client. Without these, a core
+          # 401 loses WWW-Authenticate and Set-Cookie at the Envoy boundary.
+          allowed_client_headers:
+            patterns:
+              - exact: www-authenticate
+              - exact: set-cookie
+              - exact: location
+              - exact: retry-after
               - exact: x-cheesewaf-decision
               - exact: x-cheesewaf-request-id
 
