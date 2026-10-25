@@ -980,15 +980,6 @@ func hopByHopHeader(key string) bool {
 	}
 }
 
-func bodyOnlyHeader(key string) bool {
-	switch strings.ToLower(key) {
-	case "content-length", "content-encoding", "content-range":
-		return true
-	default:
-		return false
-	}
-}
-
 func validResponseHeader(key string) (string, bool) {
 	if !validHeaderName(key) {
 		return "", false
