@@ -45,7 +45,7 @@ func TestInspect(t *testing.T) {
 }
 
 func TestInspectRejectsInvalidRequest(t *testing.T) {
-	client, err := New(Config{BaseURL: "http://core.test", InspectPath: "/inspect"})
+	client, err := New(Config{BaseURL: "https://core.test", InspectPath: "/inspect"})
 	if err != nil {
 		t.Fatal(err)
 	}

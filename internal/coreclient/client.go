@@ -3,6 +3,7 @@ package coreclient
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 	inspectionv1 "github.com/LaokeQwQ/CheeseWAF-Adapters/contracts/inspection/v1"
 )
 
+var ErrTelemetryDisabled = errors.New("telemetry is disabled")
+
 type Config struct {
 	BaseURL          string
 	InspectPath      string
@@ -24,6 +27,7 @@ type Config struct {
 	HealthPath       string
 	Token            string
 	HTTPClient       *http.Client
+	TLSConfig        *tls.Config
 	MaxResponseBytes int64
 }
 
@@ -58,9 +62,10 @@ func IsProtocolError(err error) bool {
 }
 
 func New(cfg Config) (*Client, error) {
-	base, err := url.Parse(strings.TrimSpace(cfg.BaseURL))
+	rawBaseURL := strings.TrimSpace(cfg.BaseURL)
+	base, err := url.Parse(rawBaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("parse core URL: %w", err)
+		return nil, fmt.Errorf("parse core URL %q: invalid URL", redactUserinfo(rawBaseURL))
 	}
 	if base.Scheme != "http" && base.Scheme != "https" {
 		return nil, fmt.Errorf("core URL must use http or https")
@@ -72,8 +77,8 @@ func New(cfg Config) (*Client, error) {
 	if token != "" && !validHeaderValue(token) {
 		return nil, fmt.Errorf("core token contains invalid header characters")
 	}
-	if token != "" && base.Scheme == "http" && !loopbackHost(base.Hostname()) {
-		return nil, fmt.Errorf("core token requires https for non-loopback core URL")
+	if base.Scheme == "http" && !loopbackHost(base.Hostname()) {
+		return nil, fmt.Errorf("core URL must use https for non-loopback hosts")
 	}
 	for name, path := range map[string]string{
 		"inspect":   cfg.InspectPath,
@@ -91,12 +96,21 @@ func New(cfg Config) (*Client, error) {
 	}
 	client := cfg.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: 2 * time.Second, CheckRedirect: rejectRedirects}
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		// Core traffic must be direct. Environment proxies can observe
+		// inspection metadata or impersonate a plaintext core.
+		transport.Proxy = nil
+		transport.MaxIdleConns = 100
+		transport.MaxIdleConnsPerHost = 16
+		transport.MaxConnsPerHost = 64
+		transport.IdleConnTimeout = 90 * time.Second
+		transport.TLSHandshakeTimeout = 5 * time.Second
+		if cfg.TLSConfig != nil {
+			transport.TLSClientConfig = cfg.TLSConfig.Clone()
+		}
+		client = &http.Client{Transport: transport, CheckRedirect: rejectRedirects}
 	} else {
 		copy := *client
-		if copy.Timeout <= 0 {
-			copy.Timeout = 2 * time.Second
-		}
 		// Core calls must never follow redirects: a redirect can move the
 		// bearer token to an unintended host and is not a valid core response.
 		copy.CheckRedirect = rejectRedirects
@@ -127,6 +141,32 @@ func loopbackHost(host string) bool {
 	}
 	addr, err := netip.ParseAddr(host)
 	return err == nil && addr.IsLoopback()
+}
+
+func redactUserinfo(raw string) string {
+	scheme := strings.Index(raw, "://")
+	if scheme < 0 {
+		return raw
+	}
+	start := scheme + 3
+	end := len(raw)
+	if index := strings.IndexAny(raw[start:], "/?#"); index >= 0 {
+		end = start + index
+	}
+	authority := raw[start:end]
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		return raw[:start] + "***@" + authority[at+1:] + raw[end:]
+	}
+	return raw
+}
+
+// CloseIdleConnections releases idle core connections during graceful
+// shutdown. The client remains safe to reuse for new requests.
+func (c *Client) CloseIdleConnections() {
+	if c == nil || c.httpClient == nil {
+		return
+	}
+	c.httpClient.CloseIdleConnections()
 }
 
 func validatePath(name, path string) error {
@@ -198,7 +238,10 @@ func (c *Client) Inspect(ctx context.Context, request inspectionv1.Request) (ins
 
 func (c *Client) EmitTelemetry(ctx context.Context, event TelemetryEvent) error {
 	if c.telemetryPath == "" {
-		return nil
+		return ErrTelemetryDisabled
+	}
+	if event.ContractVersion == "" {
+		event.ContractVersion = inspectionv1.Version
 	}
 	if event.Source == "" {
 		event.Source = inspectionv1.SourceGeneric
