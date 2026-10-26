@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,6 +20,9 @@ import (
 )
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
 	cfg, err := config.FromEnv()
 	if err != nil {
 		fail(err)
@@ -32,23 +36,38 @@ func main() {
 		fail(err)
 	}
 
+	tlsConfig, err := coreclient.LoadTLSConfig(
+		cfg.CoreTLSCAFile,
+		cfg.CoreTLSCertFile,
+		cfg.CoreTLSKeyFile,
+		cfg.CoreTLSServerName,
+	)
+	if err != nil {
+		fail(err)
+	}
 	core, err := coreclient.New(coreclient.Config{
 		BaseURL:       cfg.CoreURL,
 		InspectPath:   cfg.CoreInspectPath,
 		TelemetryPath: cfg.CoreTelemetryPath,
 		HealthPath:    cfg.CoreHealthPath,
 		Token:         cfg.CoreToken,
+		TLSConfig:     tlsConfig,
 	})
 	if err != nil {
 		fail(err)
 	}
+	defer core.CloseIdleConnections()
+
 	application, err := httpserver.New(cfg, core)
 	if err != nil {
 		fail(err)
 	}
 
+	listener, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		fail(err)
+	}
 	server := &http.Server{
-		Addr:              cfg.ListenAddr,
 		Handler:           application.Handler(),
 		ReadHeaderTimeout: 2 * time.Second,
 		ReadTimeout:       5 * time.Second,
@@ -57,21 +76,34 @@ func main() {
 		MaxHeaderBytes:    64 * 1024,
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	stop := make(chan os.Signal, 1)
+	stop := make(chan os.Signal, 2)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(stop)
+
+	serveErr := make(chan error, 1)
 	go func() {
-		<-stop
+		serveErr <- server.Serve(listener)
+	}()
+
+	logger.Info("CheeseWAF adapter listening", "address", listener.Addr().String(), "core", safeCoreTarget(cfg.CoreURL), "fail_mode", cfg.FailMode)
+	select {
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fail(err)
+		}
+	case sig := <-stop:
+		logger.Info("adapter shutdown requested", "signal", sig.String())
+		go func() {
+			<-stop
+			logger.Error("second shutdown signal; forcing exit")
+			os.Exit(1)
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(ctx); err != nil {
 			logger.Error("adapter shutdown failed", "error", err)
 		}
-	}()
-
-	logger.Info("CheeseWAF adapter listening", "address", cfg.ListenAddr, "core", safeCoreTarget(cfg.CoreURL), "fail_mode", cfg.FailMode)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		fail(err)
+		<-serveErr
 	}
 }
 

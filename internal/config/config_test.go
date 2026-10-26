@@ -89,3 +89,36 @@ func TestValidateRejectsInvalidTrustedProxyCIDR(t *testing.T) {
 		t.Fatal("expected trusted proxy CIDR error")
 	}
 }
+
+func TestHealthCheckTimeoutConfig(t *testing.T) {
+	def := Default()
+	if def.HealthCheckTimeout != 2*time.Second {
+		t.Fatalf("default health timeout = %s", def.HealthCheckTimeout)
+	}
+	t.Setenv("CHEESEWAF_CORE_URL", "http://core.test")
+	t.Setenv("CHEESEWAF_ADAPTER_HEALTH_TIMEOUT", "1500ms")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HealthCheckTimeout != 1500*time.Millisecond {
+		t.Fatalf("health timeout = %s", cfg.HealthCheckTimeout)
+	}
+	cfg.HealthCheckTimeout = 0
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("zero health timeout unexpectedly validated")
+	}
+}
+
+func TestValidateRejectsPartialCoreTLSPair(t *testing.T) {
+	cfg := Default()
+	cfg.CoreURL = "https://core.test"
+	cfg.CoreTLSCertFile = "client.pem"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("certificate without key unexpectedly validated")
+	}
+	cfg.CoreTLSKeyFile = "client-key.pem"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}

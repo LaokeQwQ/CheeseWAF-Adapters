@@ -54,14 +54,17 @@
     curl -i http://127.0.0.1:9080/healthz
     curl -i http://127.0.0.1:9080/readyz
 
-适配器会调用配置的核心检查接口（默认路径：`/api/v1/adapter/inspect`），并通过 `/healthz` 为 `readyz` 探测核心。核心服务使用其他路径时，可设置 `CHEESEWAF_CORE_INSPECT_PATH` 和 `CHEESEWAF_CORE_HEALTH_PATH`。
+适配器会调用配置的核心检查接口（默认路径：`/api/v1/adapter/inspect`），并通过 `/healthz` 为 `readyz` 探测核心。核心服务使用其他路径时，可设置 `CHEESEWAF_CORE_INSPECT_PATH` 和 `CHEESEWAF_CORE_HEALTH_PATH`。规范路径是 `/api/v1/adapter/*`，不是旧文档中的 `/api/v1/check`。
 
 ## 网关示例
 
-- NGINX：[adapters/nginx/auth_request.conf](adapters/nginx/auth_request.conf)
+- NGINX 元数据授权：[adapters/nginx/auth_request.conf](adapters/nginx/auth_request.conf)
+- NGINX njs PHP2Shell Body 检查：[adapters/nginx/php2shell-njs.md](adapters/nginx/php2shell-njs.md)
 - Envoy：[adapters/envoy/ext_authz.yaml](adapters/envoy/ext_authz.yaml)
 
-示例使用本机 HTTP hop。生产环境应将适配器限制在私有网络、配置 `CHEESEWAF_ADAPTER_TOKEN`（通过专用 `X-CheeseWAF-Adapter-Token` Header 传入，不读取 `Authorization`），并在跨主机或跨 Pod 时启用 mTLS。只有来自 `CHEESEWAF_ADAPTER_TRUSTED_PROXY_CIDRS` 的对端才会被信任以提供原始/转发请求元数据。
+`auth_request` 示例只转发元数据，无法检查请求 Body。PHP2Shell 的 Body 检测必须使用 njs access 阶段集成：它在 `proxy_pass` 之前读取并缓存 Body，要求 njs 1.0.2 或更高版本。adapterd 已提供 `POST /nginx/body-check`；需要设置 `CHEESEWAF_ADAPTER_FORWARD_BODY=true` 启用。仅元数据的路由在关闭 Body 转发时会报告 `body_state: withheld`，让核心区分“没有 Body”和“网关没有转发 Body”。
+
+示例使用本机 HTTP hop。生产环境应将适配器限制在私有网络、配置 `CHEESEWAF_ADAPTER_TOKEN`（通过专用 `X-CheeseWAF-Adapter-Token` Header 传入，不读取 `Authorization`），并在跨主机或跨 Pod 时启用 mTLS。非 loopback 的 core URL 必须使用 HTTPS，核心流量不会继承环境 HTTP 代理。只有来自 `CHEESEWAF_ADAPTER_TRUSTED_PROXY_CIDRS` 的对端才会被信任以提供原始/转发请求元数据；NGINX/Envoy 来源缺失原始 URI、method、host、scheme 或客户端地址时会失败关闭。
 当 Envoy 报告 `x-envoy-auth-partial-body: true` 时，适配器会把契约 Body 标记为不完整；即使核心返回 `allow`/`log` 或核心超时，也返回 HTTP 413。关闭 Body 转发时则直接拒绝该 partial-body 请求。
 
 ## 配置
@@ -69,29 +72,36 @@
 | 变量 / 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `CHEESEWAF_ADAPTER_LISTEN` / `--listen` | `127.0.0.1:9080` | 适配器监听地址。 |
-| `CHEESEWAF_CORE_URL` / `--core-url` | 必填 | 自托管 CheeseWAF 核心地址。 |
+| `CHEESEWAF_CORE_URL` / `--core-url` | 必填 | 自托管 CheeseWAF 核心地址。非 loopback 必须使用 `https://`；不会继承环境 HTTP 代理。 |
 | `CHEESEWAF_CORE_INSPECT_PATH` | `/api/v1/adapter/inspect` | inline 检查接口。 |
 | `CHEESEWAF_CORE_TELEMETRY_PATH` | `/api/v1/adapter/telemetry` | 尽力而为的 telemetry 接口。 |
-| `CHEESEWAF_CORE_HEALTH_PATH` | `/healthz` | 核心就绪探测接口；为空时关闭客户端探测。 |
+| `CHEESEWAF_CORE_HEALTH_PATH` | `/healthz` | 核心就绪探测接口；为空时关闭客户端探测。如果核心只提供 `/health`，请改为此路径。 |
 | `CHEESEWAF_CORE_TOKEN` | 空 | adapterd 发给自托管核心的 Bearer token。 |
+| `CHEESEWAF_CORE_TLS_CA_FILE` | 空 | 核心 HTTPS 证书的可选私有 CA bundle。 |
+| `CHEESEWAF_CORE_TLS_CERT_FILE` / `CHEESEWAF_CORE_TLS_KEY_FILE` | 空 | 核心 mTLS 的可选客户端证书/私钥对。 |
+| `CHEESEWAF_CORE_TLS_SERVER_NAME` | 空 | 核心证书的可选 TLS ServerName 覆盖。 |
 | `CHEESEWAF_ADAPTER_TOKEN` | 空 | 网关调用方可选的专用密钥，必须放在 `X-CheeseWAF-Adapter-Token` Header；不读取 `Authorization`，监听非 loopback 时应设置。 |
 | `CHEESEWAF_ADAPTER_TRUSTED_PROXY_CIDRS` | `127.0.0.1/32,::1/128` | 允许提供原始/转发请求元数据的对端 CIDR；仅按需扩大到受控代理网段。 |
 | `CHEESEWAF_ADAPTER_REQUEST_TIMEOUT` / `--request-timeout` | `100ms` | inline 决策预算。 |
 | `CHEESEWAF_ADAPTER_TELEMETRY_TIMEOUT` | `500ms` | telemetry 调用预算。 |
-| `CHEESEWAF_ADAPTER_FAIL_MODE` / `--fail-mode` | `closed` | `closed` 返回 `503`；`open` 在核心失败时返回 `204`。 |
+| `CHEESEWAF_ADAPTER_HEALTH_TIMEOUT` | `2s` | 核心就绪探测预算，与 inline 请求预算解耦。 |
+| `CHEESEWAF_ADAPTER_HEALTH_CHECK` | `true` | 是否启用 `/readyz` 的核心探测；`false` 时 `/readyz` 返回 disabled。 |
+| `CHEESEWAF_ADAPTER_FAIL_MODE` / `--fail-mode` | `closed` | `closed` 返回 `503`；`open` 在核心失败时返回 `204`，并记录 fail-open 日志。 |
 | `CHEESEWAF_ADAPTER_FORWARD_BODY` | `false` | 显式开启有界 Body 转发；超过上限时以 `BodyTruncated=true` 发送，若核心返回 `allow`/`log` 则适配器返回 HTTP 413。 |
 | `CHEESEWAF_ADAPTER_MAX_BODY_BYTES` | `65536` | 开启 Body 转发时的大小上限（受适配器校验约束）。 |
 | `CHEESEWAF_ADAPTER_FORWARD_SENSITIVE_HEADERS` | `false` | 显式允许向自托管核心转发带凭据的 Header。 |
 
-telemetry 接口每次只接受一个经过校验的 JSON event，并按每个 adapterd 进程每秒 100 个事件限速。健康接口保持便于探针访问；监听地址应保持私有，或配置 adapter token 与网络访问策略。
+telemetry 接口每次只接受一个经过校验的 JSON event，并按每个 adapterd 进程每秒 100 个事件限速。省略 `contract_version`/`source` 时默认 `v1`/`generic`；先校验再消耗限流额度。`CHEESEWAF_CORE_TELEMETRY_PATH` 为空时路由返回 `503`，不再接受后静默丢弃。健康接口保持便于探针访问；监听地址应保持私有，或配置 adapter token 与网络访问策略。
 
 ## 契约边界
 
 `contracts/inspection/v1` 独立于 CheeseWAF 的 `internal` 包，定义以下内容：
 
 - 请求元数据、客户端上下文、TLS 指纹字段和可选响应上下文；
+- 显式 `body_state`（`absent`/`withheld`/`forwarded`/`truncated`/`unsupported`）与 `body_encoding`；
 - `allow`、`log`、`block`、`challenge` 四种动作；
-- policy version、rule ID、响应 Header 和安全默认值。
+- policy version、rule ID、响应 Header、多个 `set_cookies`，以及带内容类型白名单的有界 challenge Body；
+- Header、authority、path/query、set-cookie 和 body 元数据的失败关闭校验。
 
 新增网关适配器必须使用这个契约或后续版本化契约。适配器不得复制检测器逻辑，也不得 import 核心仓库的 `internal/...` 包。
 
