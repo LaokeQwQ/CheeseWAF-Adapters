@@ -3,6 +3,7 @@ package httpserver
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -116,7 +117,7 @@ func (s *Server) handleAuthz(w http.ResponseWriter, r *http.Request, source insp
 		return
 	}
 	if bodyRequired && len(request.Body) == 0 && !request.BodyTruncated {
-		s.logger.Warn("body inspection request has no body", "source", source, "request_id", request.RequestID)
+		s.logger.Warn("body inspection request has no body", "source", source, "request_id", redactRequestID(request.RequestID))
 		s.writeBadRequest(w)
 		return
 	}
@@ -128,7 +129,7 @@ func (s *Server) handleAuthz(w http.ResponseWriter, r *http.Request, source insp
 		// transport fail-open turn it into an implicit allow; the gateway must
 		// retry/reject the request instead.
 		if request.BodyTruncated {
-			s.logger.Warn("body inspection truncated; refusing decision", "source", source, "request_id", request.RequestID)
+			s.logger.Warn("body inspection truncated; refusing decision", "source", source, "request_id", redactRequestID(request.RequestID))
 			s.writeBodyLimitFailure(w)
 			return
 		}
@@ -136,7 +137,7 @@ func (s *Server) handleAuthz(w http.ResponseWriter, r *http.Request, source insp
 		return
 	}
 	if request.BodyTruncated && (decision.Action == inspectionv1.ActionAllow || decision.Action == inspectionv1.ActionLog) {
-		s.logger.Warn("body inspection truncated; refusing allow", "source", source, "request_id", request.RequestID)
+		s.logger.Warn("body inspection truncated; refusing allow", "source", source, "request_id", redactRequestID(request.RequestID))
 		s.writeBodyLimitFailure(w)
 		return
 	}
@@ -197,7 +198,7 @@ func (s *Server) telemetry(w http.ResponseWriter, r *http.Request) {
 	if err := s.core.EmitTelemetry(ctx, event); err != nil {
 		// Telemetry is intentionally best effort. It must not turn an already
 		// completed gateway decision into a request failure.
-		s.logger.Warn("telemetry delivery failed", "source", event.Source, "request_id", event.RequestID, "error", err)
+		s.logger.Warn("telemetry delivery failed", "source", event.Source, "request_id", redactRequestID(event.RequestID), "error", err)
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "telemetry unavailable"})
 		return
 	}
@@ -206,7 +207,7 @@ func (s *Server) telemetry(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) writeFailure(w http.ResponseWriter, err error, source inspectionv1.Source, requestID string) {
 	if s.cfg.FailMode == "open" && coreclient.IsTransportError(err) && !coreclient.IsProtocolError(err) {
-		s.logger.Warn("core inspection unavailable; failing open", "source", source, "request_id", requestID, "error", err)
+		s.logger.Warn("core inspection unavailable; failing open", "source", source, "request_id", redactRequestID(requestID), "error", err)
 		w.Header().Set("X-CheeseWAF-Adapter-Error", "core-unavailable")
 		if source == inspectionv1.SourceEnvoyAuth || source == inspectionv1.SourceEnvoyExtProc {
 			w.WriteHeader(http.StatusOK)
@@ -215,7 +216,7 @@ func (s *Server) writeFailure(w http.ResponseWriter, err error, source inspectio
 		}
 		return
 	}
-	s.logger.Warn("core inspection failed; failing closed", "source", source, "request_id", requestID, "error", err)
+	s.logger.Warn("core inspection failed; failing closed", "source", source, "request_id", redactRequestID(requestID), "error", err)
 	s.writeClosedFailure(w)
 }
 
@@ -238,7 +239,7 @@ func (s *Server) writeBodyLimitFailure(w http.ResponseWriter) {
 func (s *Server) writeDecision(w http.ResponseWriter, decision inspectionv1.Decision, requestID string, source inspectionv1.Source) {
 	decision = decision.Normalized()
 	if err := decision.Validate(); err != nil {
-		s.logger.Warn("invalid core decision", "source", source, "request_id", requestID, "error", err)
+		s.logger.Warn("invalid core decision", "source", source, "request_id", redactRequestID(requestID), "error", err)
 		s.writeClosedFailure(w)
 		return
 	}
@@ -247,15 +248,15 @@ func (s *Server) writeDecision(w http.ResponseWriter, decision inspectionv1.Deci
 	for key, value := range decision.Headers {
 		canonical, ok := validResponseHeader(key)
 		if !ok {
-			s.logger.Warn("dropping unsupported decision header", "source", source, "request_id", requestID, "header", key)
+			s.logger.Warn("dropping unsupported decision header", "source", source, "request_id", redactRequestID(requestID), "header", key)
 			continue
 		}
 		if !validResponseHeaderValue(value) {
-			s.logger.Warn("dropping invalid decision header", "source", source, "request_id", requestID, "header", key)
+			s.logger.Warn("dropping invalid decision header", "source", source, "request_id", redactRequestID(requestID), "header", key)
 			continue
 		}
 		if headerCount >= maxResponseHeaders || totalHeaderBytes+len(canonical)+len(value) > maxResponseHeadBytes {
-			s.logger.Warn("decision headers exceed adapter limits", "source", source, "request_id", requestID)
+			s.logger.Warn("decision headers exceed adapter limits", "source", source, "request_id", redactRequestID(requestID))
 			s.writeClosedFailure(w)
 			return
 		}
@@ -269,11 +270,11 @@ func (s *Server) writeDecision(w http.ResponseWriter, decision inspectionv1.Deci
 	}
 	for _, cookie := range decision.SetCookies {
 		if !validResponseHeaderValue(cookie) {
-			s.logger.Warn("dropping invalid set-cookie", "source", source, "request_id", requestID)
+			s.logger.Warn("dropping invalid set-cookie", "source", source, "request_id", redactRequestID(requestID))
 			continue
 		}
 		if headerCount >= maxResponseHeaders || totalHeaderBytes+len("Set-Cookie")+len(cookie) > maxResponseHeadBytes {
-			s.logger.Warn("decision cookies exceed adapter limits", "source", source, "request_id", requestID)
+			s.logger.Warn("decision cookies exceed adapter limits", "source", source, "request_id", redactRequestID(requestID))
 			s.writeClosedFailure(w)
 			return
 		}
@@ -299,7 +300,7 @@ func (s *Server) writeDecision(w http.ResponseWriter, decision inspectionv1.Deci
 		}
 		if len(decision.Body) > 0 {
 			if !validResponseContentType(decision.BodyContentType) {
-				s.logger.Warn("invalid decision body content type", "source", source, "request_id", requestID, "content_type", decision.BodyContentType)
+				s.logger.Warn("invalid decision body content type", "source", source, "request_id", redactRequestID(requestID), "content_type", decision.BodyContentType)
 				s.writeClosedFailure(w)
 				return
 			}
@@ -530,7 +531,7 @@ func requestFromGateway(r *http.Request, source inspectionv1.Source, cfg config.
 		return inspectionv1.Request{}, err
 	}
 	if !validGatewayMethod(method) {
-		return inspectionv1.Request{}, fmt.Errorf("invalid gateway method %q", method)
+		return inspectionv1.Request{}, fmt.Errorf("invalid gateway method %q", redactLogToken(method))
 	}
 	authorityValue := safeAuthority(authority)
 	if authorityValue == "" {
@@ -688,7 +689,7 @@ func copiedHeaders(input http.Header, forwardSensitiveHeaders, forwardBody bool)
 			continue
 		}
 		if isSingleValueHeader(canonical) && len(values) > 1 {
-			return nil, fmt.Errorf("request header %q must have a single value", canonical)
+			return nil, fmt.Errorf("request header %q must have a single value", redactLogToken(canonical))
 		}
 		if count >= maxHeaderCount {
 			return nil, fmt.Errorf("request header count exceeds %d", maxHeaderCount)
@@ -696,10 +697,10 @@ func copiedHeaders(input http.Header, forwardSensitiveHeaders, forwardBody bool)
 		clean := make([]string, 0, len(values))
 		for _, value := range values {
 			if len(value) > maxHeaderValueBytes {
-				return nil, fmt.Errorf("request header %q exceeds %d bytes", canonical, maxHeaderValueBytes)
+				return nil, fmt.Errorf("request header %q exceeds %d bytes", redactLogToken(canonical), maxHeaderValueBytes)
 			}
 			if !utf8.ValidString(value) || strings.ContainsAny(value, "\r\n") || strings.IndexFunc(value, func(r rune) bool { return r < ' ' || r == 127 }) >= 0 {
-				return nil, fmt.Errorf("request header %q contains invalid characters", canonical)
+				return nil, fmt.Errorf("request header %q contains invalid characters", redactLogToken(canonical))
 			}
 			if totalBytes+len(canonical)+len(value) > maxHeaderBytes {
 				return nil, fmt.Errorf("request headers exceed %d bytes", maxHeaderBytes)
@@ -933,6 +934,46 @@ func safeRequestID(value string) string {
 		return ""
 	}
 	return value
+}
+
+// redactRequestID renders a gateway-supplied request ID for the log stream.
+//
+// The ID is read verbatim from the X-Request-ID header, so its bytes are
+// chosen by the gateway and, transitively, by the client behind it. Writing
+// them to disk unchanged turns every log line into a place where arbitrary
+// caller-chosen text is persisted and later parsed by collectors. Only a
+// digest prefix and the length are logged: identical IDs still produce
+// identical tokens, so a request can be correlated across log lines, and the
+// length still separates a supplied ID from the generated 32-hex fallback.
+func redactRequestID(value string) string {
+	if value == "" {
+		return "-"
+	}
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x/%d", sum[:6], len(value))
+}
+
+// redactLogToken renders a gateway-supplied token (a header name or method)
+// for an error message. Callers only reach this after the token failed or
+// passed validation, so the input cannot be trusted to be a header token yet:
+// the rendering keeps the header-token alphabet and drops everything else.
+func redactLogToken(value string) string {
+	var builder strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			builder.WriteRune(r)
+		default:
+			builder.WriteByte('?')
+		}
+		if builder.Len() >= 64 {
+			break
+		}
+	}
+	if builder.Len() == 0 {
+		return "?"
+	}
+	return builder.String()
 }
 
 func safeAuthority(value string) string {

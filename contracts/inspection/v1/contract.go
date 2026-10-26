@@ -130,7 +130,9 @@ func (r Request) Validate() error {
 		return fmt.Errorf("method is required")
 	}
 	if !validMethod(r.Method) {
-		return fmt.Errorf("invalid method %q", r.Method)
+		// Validation errors are logged by callers, so they describe the failure
+		// mode without echoing the rejected value.
+		return fmt.Errorf("invalid method")
 	}
 	if r.Source != "" && !validSource(r.Source) {
 		return fmt.Errorf("unsupported source %q", r.Source)
@@ -418,10 +420,10 @@ func validateHeaderMap(headers map[string][]string) error {
 			return fmt.Errorf("invalid request header name")
 		}
 		if isForbiddenHopHeader(name) {
-			return fmt.Errorf("request header %q is hop-by-hop", name)
+			return fmt.Errorf("request header is hop-by-hop")
 		}
 		if len(values) == 0 {
-			return fmt.Errorf("request header %q has no values", name)
+			return fmt.Errorf("request header has no values")
 		}
 		for _, value := range values {
 			if !validHeaderText(value, maxHeaderValueBytes) {

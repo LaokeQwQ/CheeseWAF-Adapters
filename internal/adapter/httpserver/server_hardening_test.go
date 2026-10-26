@@ -3,6 +3,7 @@ package httpserver
 import (
 	"bytes"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -321,5 +322,37 @@ func TestIPv4MappedTrustedPeer(t *testing.T) {
 	}
 	if got.Path != "/mapped" {
 		t.Fatalf("path = %q, want /mapped", got.Path)
+	}
+}
+
+func TestGatewayRequestIDIsRedactedInLogs(t *testing.T) {
+	server := newHardeningServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("core was called for a rejected request")
+	}, func(cfg *config.Config) { cfg.ForwardBody = true; cfg.MaxBodyBytes = 1024 })
+
+	var logs bytes.Buffer
+	server.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	const marker = "gw-req-9f2b7c1d"
+	request := httptest.NewRequest(http.MethodPost, "http://adapter/nginx/body-check", nil)
+	request.RemoteAddr = "127.0.0.1:1234"
+	request.Header.Set("X-Request-ID", marker)
+	request.Header.Set("X-Original-Method", http.MethodPost)
+	request.Header.Set("X-Original-URI", "/upload")
+	request.Header.Set("X-Forwarded-Host", "app.example")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("X-Real-IP", "203.0.113.10")
+	if response := serve(t, server, request); response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", response.Code, response.Body.String())
+	}
+
+	if logs.Len() == 0 {
+		t.Fatal("no log line captured")
+	}
+	if strings.Contains(logs.String(), marker) {
+		t.Fatalf("gateway request id reached the log stream: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), redactRequestID(marker)) {
+		t.Fatalf("log line lost request correlation: %s", logs.String())
 	}
 }
